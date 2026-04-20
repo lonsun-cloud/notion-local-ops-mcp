@@ -23,6 +23,7 @@ Optional:
 - NOTION_LOCAL_OPS_PORT (defaults to 8766)
 - NOTION_LOCAL_OPS_CLOUDFLARED_CONFIG (named tunnel config path)
 - NOTION_LOCAL_OPS_TUNNEL_NAME (optional override for cloudflared tunnel run)
+- NOTION_LOCAL_OPS_VENV_PATH (skip venv prompt; use this path directly)
 
 If ./cloudflared.local.yml or ./cloudflared.local.yaml exists, this script
 uses that named tunnel config automatically. Otherwise it falls back to a
@@ -129,13 +130,52 @@ trap cleanup EXIT INT TERM
 
 require_command cloudflared
 
-PYTHON_BIN="$(pick_python)"
-if [[ ! -d "${ROOT_DIR}/.venv" ]]; then
-  "${PYTHON_BIN}" -m venv "${ROOT_DIR}/.venv"
-fi
+# --- Python virtual environment bootstrap ---
+ensure_deps() {
+  if ! command -v notion-local-ops-mcp >/dev/null 2>&1 || ! python - <<'PY' >/dev/null 2>&1
+import fastmcp
+import uvicorn
+PY
+  then
+    python -m pip install -r requirements.txt
+    python -m pip install -e .
+  fi
+}
 
-# shellcheck disable=SC1091
-source "${ROOT_DIR}/.venv/bin/activate"
+if [[ -n "${NOTION_LOCAL_OPS_VENV_PATH:-}" ]]; then
+  # Non-interactive: env var skips the prompt (for CI / automation)
+  VENV_DIR="$(resolve_path "${NOTION_LOCAL_OPS_VENV_PATH}")"
+  if [[ ! -f "${VENV_DIR}/bin/python" ]]; then
+    echo "Invalid venv path: ${VENV_DIR} (bin/python not found)" >&2
+    exit 1
+  fi
+  # shellcheck disable=SC1091
+  source "${VENV_DIR}/bin/activate"
+else
+  read -rp "Do you have an existing Python virtual environment? [y/N]: " HAS_VENV
+  case "${HAS_VENV}" in
+    [Yy]*)
+      read -rp "Enter your virtual environment path (e.g. /home/user/myenv): " USER_VENV_PATH
+      VENV_DIR="$(resolve_path "${USER_VENV_PATH}")"
+      if [[ ! -f "${VENV_DIR}/bin/python" ]]; then
+        echo "Invalid venv path: ${VENV_DIR} (bin/python not found)" >&2
+        exit 1
+      fi
+      # shellcheck disable=SC1091
+      source "${VENV_DIR}/bin/activate"
+      ;;
+    *)
+      PYTHON_BIN="$(pick_python)"
+      VENV_DIR="${ROOT_DIR}/.venv"
+      if [[ ! -d "${VENV_DIR}" ]]; then
+        echo "Creating virtual environment at ${VENV_DIR}..."
+        "${PYTHON_BIN}" -m venv "${VENV_DIR}"
+      fi
+      # shellcheck disable=SC1091
+      source "${VENV_DIR}/bin/activate"
+      ;;
+  esac
+fi
 
 python - <<'PY'
 import sys
@@ -144,14 +184,7 @@ if sys.version_info < (3, 11):
     raise SystemExit("Python 3.11+ is required.")
 PY
 
-if ! command -v notion-local-ops-mcp >/dev/null 2>&1 || ! python - <<'PY' >/dev/null 2>&1
-import fastmcp
-import uvicorn
-PY
-then
-  python -m pip install -r requirements.txt
-  python -m pip install -e .
-fi
+ensure_deps
 
 OVERRIDE_HOST="${NOTION_LOCAL_OPS_HOST:-}"
 OVERRIDE_PORT="${NOTION_LOCAL_OPS_PORT:-}"

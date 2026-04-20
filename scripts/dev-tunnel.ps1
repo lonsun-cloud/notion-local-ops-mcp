@@ -26,6 +26,7 @@ Optional:
 - NOTION_LOCAL_OPS_PORT (defaults to 8766)
 - NOTION_LOCAL_OPS_CLOUDFLARED_CONFIG (named tunnel config path)
 - NOTION_LOCAL_OPS_TUNNEL_NAME (optional override for cloudflared tunnel run)
+- NOTION_LOCAL_OPS_VENV_PATH (skip venv prompt; use this path directly)
 
 If .\cloudflared.local.yml or .\cloudflared.local.yaml exists, this script
 uses that named tunnel config automatically. Otherwise it falls back to a
@@ -134,6 +135,23 @@ function Wait-ForServer {
     return $false
 }
 
+function Ensure-Deps {
+    param([Parameter(Mandatory)][string]$PyExe)
+    $serverExe = Join-Path (Split-Path $PyExe) 'notion-local-ops-mcp.exe'
+    $needsInstall = $false
+    if (-not (Test-Path -LiteralPath $serverExe)) { $needsInstall = $true }
+    if (-not $needsInstall) {
+        & $PyExe -c "import fastmcp, uvicorn" *> $null
+        if ($LASTEXITCODE -ne 0) { $needsInstall = $true }
+    }
+    if ($needsInstall) {
+        & $PyExe -m pip install -r (Join-Path $RootDir 'requirements.txt')
+        if ($LASTEXITCODE -ne 0) { Write-Error "pip install requirements failed"; exit 1 }
+        & $PyExe -m pip install -e $RootDir
+        if ($LASTEXITCODE -ne 0) { Write-Error "pip install -e failed"; exit 1 }
+    }
+}
+
 # Preserve shell overrides before loading .env
 $Overrides = @{}
 foreach ($name in @(
@@ -154,33 +172,43 @@ foreach ($name in @(
 
 Require-Command cloudflared
 
-$PythonBin = Pick-Python
-$VenvDir   = Join-Path $RootDir '.venv'
-if (-not (Test-Path -LiteralPath $VenvDir)) {
-    & $PythonBin -m venv $VenvDir
-    if ($LASTEXITCODE -ne 0) { Write-Error "Failed to create venv"; exit 1 }
+# --- Python virtual environment bootstrap ---
+if ($env:NOTION_LOCAL_OPS_VENV_PATH) {
+    # Non-interactive: env var skips the prompt (for CI / automation)
+    $VenvDir = Resolve-RepoPath $env:NOTION_LOCAL_OPS_VENV_PATH
+    $VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
+    if (-not (Test-Path -LiteralPath $VenvPython)) {
+        Write-Error "Invalid venv path: $VenvDir (Scripts\python.exe not found)"
+        exit 1
+    }
+} else {
+    $hasVenv = Read-Host "Do you have an existing Python virtual environment? [y/N]"
+    if ($hasVenv -match '^[Yy]') {
+        $userVenvPath = Read-Host "Enter your virtual environment path (e.g. C:\Users\you\myenv)"
+        $VenvDir = Resolve-RepoPath $userVenvPath
+        $VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
+        if (-not (Test-Path -LiteralPath $VenvPython)) {
+            Write-Error "Invalid venv path: $VenvDir (Scripts\python.exe not found)"
+            exit 1
+        }
+    } else {
+        $PythonBin = Pick-Python
+        $VenvDir   = Join-Path $RootDir '.venv'
+        if (-not (Test-Path -LiteralPath $VenvDir)) {
+            Write-Host "Creating virtual environment at $VenvDir..."
+            & $PythonBin -m venv $VenvDir
+            if ($LASTEXITCODE -ne 0) { Write-Error "Failed to create venv"; exit 1 }
+        }
+        $VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
+        if (-not (Test-Path -LiteralPath $VenvPython)) {
+            Write-Error "venv python not found at $VenvPython"
+            exit 1
+        }
+    }
 }
 
-$VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
 $VenvServer = Join-Path $VenvDir 'Scripts\notion-local-ops-mcp.exe'
-
-if (-not (Test-Path -LiteralPath $VenvPython)) {
-    Write-Error "venv python not found at $VenvPython"
-    exit 1
-}
-
-$needsInstall = $false
-if (-not (Test-Path -LiteralPath $VenvServer)) { $needsInstall = $true }
-if (-not $needsInstall) {
-    & $VenvPython -c "import fastmcp, uvicorn" *> $null
-    if ($LASTEXITCODE -ne 0) { $needsInstall = $true }
-}
-if ($needsInstall) {
-    & $VenvPython -m pip install -r (Join-Path $RootDir 'requirements.txt')
-    if ($LASTEXITCODE -ne 0) { Write-Error "pip install requirements failed"; exit 1 }
-    & $VenvPython -m pip install -e $RootDir
-    if ($LASTEXITCODE -ne 0) { Write-Error "pip install -e failed"; exit 1 }
-}
+Ensure-Deps -PyExe $VenvPython
 
 Load-EnvFile
 
