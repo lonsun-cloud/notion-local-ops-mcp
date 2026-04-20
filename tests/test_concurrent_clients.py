@@ -120,7 +120,7 @@ def test_two_clients_share_one_mutable_workspace_state(tmp_path: Path, monkeypat
                             )
                             second_read = await _call_tool_structured(
                                 second_session,
-                                "read_file",
+                                "read_text",
                                 {"path": "shared.txt"},
                             )
                             second_write = await _call_tool_structured(
@@ -133,7 +133,7 @@ def test_two_clients_share_one_mutable_workspace_state(tmp_path: Path, monkeypat
                             )
                             first_read = await _call_tool_structured(
                                 first_session,
-                                "read_file",
+                                "read_text",
                                 {"path": "shared.txt"},
                             )
                             return first_write, second_read, second_write, first_read

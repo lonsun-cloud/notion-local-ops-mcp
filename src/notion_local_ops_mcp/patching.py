@@ -186,13 +186,64 @@ def _find_sequence(lines: list[str], needle: list[str], start: int) -> int:
     return -1
 
 
-def _apply_hunk(lines: list[str], hunk: UpdateHunk, cursor: int) -> tuple[list[str], int]:
+def _fuzzy_hunk_candidates(
+    lines: list[str], needle: list[str], *, k: int = 3
+) -> list[dict[str, object]]:
+    """Return the top ``k`` line windows in ``lines`` that most resemble
+    ``needle``. Each result carries a 1-based ``line``, similarity ratio and
+    a short ``snippet`` so failure payloads can guide the caller.
+    """
+    window_size = max(len(needle), 1)
+    needle_blob = "\n".join(needle)
+    if not lines or not needle_blob:
+        return []
+    scored: list[tuple[float, int, str]] = []
+    for i in range(0, max(len(lines) - window_size + 1, 1)):
+        window = "\n".join(lines[i : i + window_size])
+        ratio = difflib.SequenceMatcher(None, window, needle_blob, autojunk=False).ratio()
+        if ratio <= 0.0:
+            continue
+        scored.append((ratio, i + 1, window))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    suggestions: list[dict[str, object]] = []
+    for ratio, line_no, snippet in scored[:k]:
+        preview = snippet if len(snippet) <= 400 else snippet[:400] + "\u2026"
+        suggestions.append(
+            {
+                "line": line_no,
+                "similarity": round(ratio, 3),
+                "snippet": preview,
+            }
+        )
+    return suggestions
+
+
+def _apply_hunk(
+    lines: list[str],
+    hunk: UpdateHunk,
+    cursor: int,
+    *,
+    path: Path,
+    hunk_index: int,
+) -> tuple[list[str], int]:
     old_lines = [line.text for line in hunk.lines if line.kind != "+"]
     new_lines = [line.text for line in hunk.lines if line.kind != "-"]
     search_start = max(cursor - len(old_lines), 0)
     match_index = _find_sequence(lines, old_lines, search_start)
     if match_index == -1:
-        raise PatchError("patch_context_not_found", "Could not match update hunk in target file.")
+        raise PatchError(
+            "patch_context_not_found",
+            (
+                f"Could not match update hunk #{hunk_index + 1} in {path}. "
+                "See `candidates` for the closest line windows; the hunk's expected "
+                "context is in `expected`."
+            ),
+            path=str(path),
+            hunk_index=hunk_index,
+            expected=old_lines,
+            search_started_at_line=search_start + 1,
+            candidates=_fuzzy_hunk_candidates(lines, old_lines, k=3),
+        )
     updated = lines[:match_index] + new_lines + lines[match_index + len(old_lines) :]
     return updated, match_index + len(new_lines)
 
@@ -206,8 +257,8 @@ def _plan_update(path: Path, move_to: Path | None, hunks: list[UpdateHunk]) -> P
     original = _read_text(path)
     lines = _split_lines(original)
     cursor = 0
-    for hunk in hunks:
-        lines, cursor = _apply_hunk(lines, hunk, cursor)
+    for hunk_index, hunk in enumerate(hunks):
+        lines, cursor = _apply_hunk(lines, hunk, cursor, path=path, hunk_index=hunk_index)
 
     target = move_to or path
     if move_to and move_to.exists() and move_to != path:

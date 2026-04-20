@@ -3,6 +3,41 @@ from pathlib import Path
 from notion_local_ops_mcp.patching import apply_patch
 
 
+def test_apply_patch_returns_candidates_when_context_missing(tmp_path: Path) -> None:
+    target = tmp_path / "app.py"
+    target.write_text(
+        "def greet(name):\n    print('hello ' + name)\n\n"
+        "def farewell(name):\n    print('bye ' + name)\n",
+        encoding="utf-8",
+    )
+
+    result = apply_patch(
+        patch="\n".join(
+            [
+                "*** Begin Patch",
+                "*** Update File: app.py",
+                "@@",
+                " def greet(name):",
+                "-    print('hi ' + name)",
+                "+    print('HELLO ' + name)",
+                "*** End Patch",
+            ]
+        ),
+        workspace_root=tmp_path,
+    )
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "patch_context_not_found"
+    assert result["hunk_index"] == 0
+    assert result["expected"] == ["def greet(name):", "    print('hi ' + name)"]
+    candidates = result["candidates"]
+    assert isinstance(candidates, list) and candidates
+    top = candidates[0]
+    assert {"line", "similarity", "snippet"} <= set(top)
+    # File untouched on failure.
+    assert "hi " not in target.read_text(encoding="utf-8")
+
+
 def test_apply_patch_adds_file(tmp_path: Path) -> None:
     result = apply_patch(
         patch="\n".join(

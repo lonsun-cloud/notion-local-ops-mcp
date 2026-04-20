@@ -1,6 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+
+
+def _call(tool, *args, **kwargs):
+    fn = tool.fn if hasattr(tool, "fn") else tool
+    result = fn(*args, **kwargs)
+    if asyncio.iscoroutine(result):
+        return asyncio.run(result)
+    return result
 
 
 def test_server_list_skills_tool_returns_structured_summary(tmp_path: Path) -> None:
@@ -22,7 +31,7 @@ def test_server_list_skills_tool_returns_structured_summary(tmp_path: Path) -> N
     )
 
     server.WORKSPACE_ROOT = workspace_root
-    result = server.list_skills(include_global=False)
+    result = _call(server.list_skills, include_global=False)
 
     assert result["success"] is True
     assert result["skills"] == [

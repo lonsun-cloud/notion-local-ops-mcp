@@ -282,9 +282,33 @@ def test_run_task_decodes_utf8_process_output(tmp_path: Path, monkeypatch) -> No
         acceptance_criteria=[],
         verification_commands=[],
         commit_mode="allowed",
+        output_schema=None,
+        parse_structured_output=True,
     )
 
     assert popen_kwargs["text"] is False
     assert store.get(task["task_id"])["status"] == "succeeded"
     assert store.read_stdout(task["task_id"]) == "done \u2603\ufffd"
     assert store.read_stderr(task["task_id"]) == "warn \ufffd"
+
+
+def test_delegate_task_extracts_structured_json_output(tmp_path: Path) -> None:
+    store = TaskStore(tmp_path / "state")
+    registry = ExecutorRegistry(
+        store=store,
+        codex_command="python3 -c \"print('{\\\"ok\\\": true}')\"",
+        claude_command="python3 -c \"print('claude')\"",
+    )
+
+    task = registry.submit(
+        task="emit json",
+        executor="codex",
+        cwd=tmp_path,
+        timeout=5,
+        output_schema={"type": "object"},
+        parse_structured_output=True,
+    )
+    result = registry.wait(task["task_id"], timeout=2, poll_interval=0.05)
+
+    assert result["status"] == "succeeded"
+    assert result["structured_output"] == {"ok": True}

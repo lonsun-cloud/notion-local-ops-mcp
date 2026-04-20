@@ -11,3 +11,4 @@ __pycache__/
 *.log
 *.egg-info/
 .DS_Store
+.wrangler/

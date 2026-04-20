@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-from typing import Any
-
 from fastmcp import FastMCP
-from fastmcp.exceptions import AuthorizationError
-from fastmcp.server.dependencies import get_http_request
-from fastmcp.server.middleware import Middleware
+import re
 import uvicorn
+
+from .http_compat import build_http_compat_app
 
 from .config import (
     APP_NAME,
@@ -25,40 +23,26 @@ from .executors import ExecutorRegistry
 from .files import list_files as list_files_impl
 from .files import read_file as read_file_impl
 from .files import read_files as read_files_impl
-from .files import replace_in_file as replace_in_file_impl
 from .files import write_file as write_file_impl
+from .gitops import git_blame as git_blame_impl
 from .gitops import git_commit as git_commit_impl
 from .gitops import git_diff as git_diff_impl
 from .gitops import git_log as git_log_impl
+from .gitops import git_show as git_show_impl
 from .gitops import git_status as git_status_impl
 from .patching import apply_patch as apply_patch_impl
+from . import session
 from .pathing import resolve_cwd, resolve_path
 from .search import glob_files as glob_files_impl
 from .search import grep_files as grep_files_impl
-from .search import search_files as search_files_impl
 from .shell import run_command as run_command_impl
 from .skills import list_skills as list_skills_impl
 from .tasks import TaskStore
 
 
-def _extract_bearer_token(headers: dict[str, str]) -> str:
-    authorization = headers.get("authorization", "").strip()
-    if authorization.lower().startswith("bearer "):
-        return authorization[7:].strip()
-    return ""
-
-
-class BearerAuthMiddleware(Middleware):
-    async def on_request(self, context: Any, call_next: Any) -> Any:
-        if not AUTH_TOKEN:
-            return await call_next(context)
-        request = get_http_request()
-        headers = {str(key).lower(): str(value) for key, value in request.headers.items()}
-        token = _extract_bearer_token(headers)
-        if token != AUTH_TOKEN:
-            raise AuthorizationError("Unauthorized: invalid bearer token.")
-        return await call_next(context)
-
+# Bearer auth lives exclusively in the HTTP layer (http_compat.HTTPBearerAuthMiddleware)
+# so unauthenticated clients can't even open an SSE session. The FastMCP
+# protocol-layer middleware was redundant and has been removed.
 
 store = TaskStore(STATE_DIR)
 registry = ExecutorRegistry(
@@ -67,14 +51,21 @@ registry = ExecutorRegistry(
     claude_command=CLAUDE_COMMAND,
 )
 
+MCP_INSTRUCTIONS = (
+    "Use direct tools first for normal tasks: list/glob/grep/read/replace/write/patch/git/run. "
+    "Use delegate_task only when direct tools are insufficient for a complex, long-running, or multi-file task."
+)
+
 mcp = FastMCP(
     APP_NAME,
-    instructions=(
-        "Use direct tools first for normal tasks: list/glob/grep/read/replace/write/patch/git/run. "
-        "Use delegate_task only when direct tools are insufficient for a complex, long-running, or multi-file task."
-    ),
-    middleware=[BearerAuthMiddleware()],
+    instructions=MCP_INSTRUCTIONS,
 )
+
+
+def _current_auth_token() -> str:
+    # Resolved via module globals so tests that monkeypatch ``AUTH_TOKEN`` on
+    # this module (and runtime overrides) are honored per-request.
+    return globals().get("AUTH_TOKEN", "") or ""
 
 
 @mcp.tool(
@@ -97,53 +88,48 @@ def list_skills(
 
 @mcp.tool(
     name="list_files",
-    description="List files and directories. Use this before reading or editing when you need folder context.",
+    description=(
+        "List files and directories. Hidden entries, common junk dirs "
+        "(.git / .venv / node_modules / __pycache__ / ...) and .gitignore'd "
+        "paths are excluded by default. Set include_hidden=True or "
+        "respect_gitignore=False to see them; add exclude_patterns for "
+        "fnmatch-style patterns (matched against both name and relative path)."
+    ),
 )
 def list_files(
     path: str | None = None,
     recursive: bool = False,
     limit: int = 200,
     offset: int = 0,
+    include_hidden: bool = False,
+    respect_gitignore: bool = True,
+    exclude_patterns: list[str] | None = None,
 ) -> dict[str, object]:
     target = resolve_path(path or ".", WORKSPACE_ROOT)
-    return list_files_impl(target, recursive=recursive, limit=limit, offset=offset)
+    return list_files_impl(
+        target,
+        recursive=recursive,
+        limit=limit,
+        offset=offset,
+        include_hidden=include_hidden,
+        respect_gitignore=respect_gitignore,
+        exclude_patterns=exclude_patterns,
+    )
 
 
 @mcp.tool(
-    name="search_files",
-    description="Simple substring search in files. Prefer grep_files for regex, context lines, or advanced filtering.",
+    name="search",
+    description=(
+        "Canonical search tool that unifies glob, regex grep, and plain-text search. "
+        "Use mode='glob' for path discovery, mode='regex' for code/text regex, and "
+        "mode='text' for literal substring search."
+    ),
 )
-def search_files(
-    query: str,
+def search(
+    mode: str = "regex",
     path: str | None = None,
-    glob: str | None = None,
-    limit: int = 100,
-) -> dict[str, object]:
-    target = resolve_path(path or ".", WORKSPACE_ROOT)
-    return search_files_impl(target, query=query, glob_pattern=glob, limit=limit)
-
-
-@mcp.tool(
-    name="glob_files",
-    description="Find files or directories by glob pattern. Use this to narrow candidate paths before reading or editing.",
-)
-def glob_files(
-    pattern: str,
-    path: str | None = None,
-    limit: int = 200,
-    offset: int = 0,
-) -> dict[str, object]:
-    target = resolve_path(path or ".", WORKSPACE_ROOT)
-    return glob_files_impl(target, pattern=pattern, limit=limit, offset=offset)
-
-
-@mcp.tool(
-    name="grep_files",
-    description="Advanced regex search across files with glob filtering, context lines, and alternate output modes.",
-)
-def grep_files(
-    pattern: str,
-    path: str | None = None,
+    pattern: str | None = None,
+    query: str | None = None,
     glob: str | None = None,
     output_mode: str = "content",
     before: int = 0,
@@ -154,63 +140,122 @@ def grep_files(
     multiline: bool = False,
 ) -> dict[str, object]:
     target = resolve_path(path or ".", WORKSPACE_ROOT)
-    return grep_files_impl(
-        target,
-        pattern=pattern,
-        glob_pattern=glob,
-        output_mode=output_mode,
-        before=before,
-        after=after,
-        ignore_case=ignore_case,
-        head_limit=limit,
-        offset=offset,
-        multiline=multiline,
+
+    if mode == "glob":
+        if not pattern:
+            return {
+                "success": False,
+                "error": {"code": "missing_pattern", "message": "mode=glob requires `pattern`."},
+            }
+        result = glob_files_impl(target, pattern=pattern, limit=limit, offset=offset)
+        if isinstance(result, dict):
+            result["mode"] = mode
+        return result
+
+    if mode in {"regex", "text"}:
+        effective_pattern = pattern
+        if mode == "text":
+            if query is None:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "missing_query",
+                        "message": "mode=text requires `query`.",
+                    },
+                }
+            effective_pattern = re.escape(query)
+        elif effective_pattern is None:
+            return {
+                "success": False,
+                "error": {"code": "missing_pattern", "message": "mode=regex requires `pattern`."},
+            }
+
+        result = grep_files_impl(
+            target,
+            pattern=effective_pattern,
+            glob_pattern=glob,
+            output_mode=output_mode,
+            before=before,
+            after=after,
+            ignore_case=ignore_case,
+            head_limit=limit,
+            offset=offset,
+            multiline=multiline,
+        )
+        if isinstance(result, dict):
+            result["mode"] = mode
+            if mode == "text" and query is not None:
+                result["query"] = query
+        return result
+
+    return {
+        "success": False,
+        "error": {
+            "code": "invalid_mode",
+            "message": "mode must be one of: glob, regex, text.",
+        },
+    }
+
+
+@mcp.tool(
+    name="read_text",
+    description=(
+        "Canonical text-reader tool. Pass either `path` for single-file reads or "
+        "`paths` for batch reads. Pagination is line-based via start_line/line_limit."
+    ),
+)
+def read_text(
+    path: str | None = None,
+    paths: list[str] | None = None,
+    start_line: int | None = None,
+    line_limit: int | None = None,
+) -> dict[str, object]:
+    has_path = bool(path)
+    has_paths = bool(paths)
+    if has_path == has_paths:
+        return {
+            "success": False,
+            "error": {
+                "code": "invalid_arguments",
+                "message": "Provide exactly one of `path` or `paths`.",
+            },
+        }
+
+    effective_offset = start_line
+    effective_limit = line_limit
+    if path:
+        target = resolve_path(path, WORKSPACE_ROOT)
+        result = read_file_impl(
+            target,
+            offset=effective_offset,
+            limit=effective_limit,
+            max_lines=200,
+            max_bytes=32768,
+        )
+        if isinstance(result, dict):
+            result["mode"] = "single"
+        return result
+
+    targets = [resolve_path(item, WORKSPACE_ROOT) for item in (paths or [])]
+    result = read_files_impl(
+        targets,
+        offset=effective_offset,
+        limit=effective_limit,
+        max_lines=200,
+        max_bytes=32768,
     )
-
-
-@mcp.tool(
-    name="read_file",
-    description="Read a text file with optional offset and limit.",
-)
-def read_file(path: str, offset: int | None = None, limit: int | None = None) -> dict[str, object]:
-    target = resolve_path(path, WORKSPACE_ROOT)
-    return read_file_impl(target, offset=offset, limit=limit, max_lines=200, max_bytes=32768)
-
-
-@mcp.tool(
-    name="read_files",
-    description="Read multiple text files with the same optional offset and limit.",
-)
-def read_files(
-    paths: list[str],
-    offset: int | None = None,
-    limit: int | None = None,
-) -> dict[str, object]:
-    targets = [resolve_path(path, WORKSPACE_ROOT) for path in paths]
-    return read_files_impl(targets, offset=offset, limit=limit, max_lines=200, max_bytes=32768)
-
-
-@mcp.tool(
-    name="replace_in_file",
-    description="Replace an exact text fragment in a file. Can replace one unique match or all matches.",
-)
-def replace_in_file(
-    path: str,
-    old_text: str,
-    new_text: str,
-    replace_all: bool = False,
-) -> dict[str, object]:
-    target = resolve_path(path, WORKSPACE_ROOT)
-    return replace_in_file_impl(target, old_text=old_text, new_text=new_text, replace_all=replace_all)
+    if isinstance(result, dict):
+        result["mode"] = "batch"
+    return result
 
 
 @mcp.tool(
     name="write_file",
-    description="Write full content to a file, creating parent directories when needed.",
+    description="Write full content to a file (supports dry_run preview without touching disk).",
 )
-def write_file(path: str, content: str) -> dict[str, object]:
+def write_file(path: str, content: str, dry_run: bool = False) -> dict[str, object]:
     target = resolve_path(path, WORKSPACE_ROOT)
-    return write_file_impl(target, content=content)
+    return write_file_impl(target, content=content, dry_run=dry_run)
 
 
 @mcp.tool(
@@ -233,6 +278,106 @@ def apply_patch(
 
 
 @mcp.tool(
+    name="server_info",
+    description=(
+        "Return server metadata: app name, host/port, workspace root, state dir, "
+        "timeouts, auth mode, and the list of registered tools. Useful as a first "
+        "call to confirm which bridge you are connected to and what it can do."
+    ),
+)
+async def server_info() -> dict[str, object]:
+    list_tools = getattr(mcp, "_list_tools")
+    try:
+        registered = await list_tools()
+    except TypeError:
+        # fastmcp 2.14 requires a context arg; None works for server-side listing.
+        registered = await list_tools(None)
+    tools = sorted(tool.name for tool in registered)
+    session_cwd = session.get_default_cwd()
+    return {
+        "success": True,
+        "app_name": APP_NAME,
+        "host": HOST,
+        "port": PORT,
+        "workspace_root": str(WORKSPACE_ROOT),
+        "session_cwd": str(session_cwd) if session_cwd else None,
+        "state_dir": str(STATE_DIR),
+        "command_timeout_seconds": COMMAND_TIMEOUT,
+        "delegate_timeout_seconds": DELEGATE_TIMEOUT,
+        "auth": "bearer" if AUTH_TOKEN else "none",
+        "codex_command": CODEX_COMMAND,
+        "claude_command": CLAUDE_COMMAND,
+        "tools": tools,
+        "tool_count": len(tools),
+    }
+
+
+@mcp.tool(
+    name="set_default_cwd",
+    description=(
+        "Set the session-wide default working directory used whenever a tool call "
+        "omits `cwd`. Pass null (or omit path) to clear the override and fall back to "
+        "the server's workspace root. Useful when running many commands in the same "
+        "repo: set it once instead of passing `cwd` on every call."
+    ),
+)
+def set_default_cwd(path: str | None = None) -> dict[str, object]:
+    if not path:
+        session.set_default_cwd(None)
+        return {
+            "success": True,
+            "session_cwd": None,
+            "workspace_root": str(WORKSPACE_ROOT),
+            "cleared": True,
+        }
+    target = resolve_path(path, WORKSPACE_ROOT)
+    if not target.exists():
+        return {
+            "success": False,
+            "error": {
+                "code": "cwd_not_found",
+                "message": f"Path does not exist: {target}",
+            },
+            "path": str(target),
+        }
+    if not target.is_dir():
+        return {
+            "success": False,
+            "error": {
+                "code": "cwd_not_directory",
+                "message": f"Path is not a directory: {target}",
+            },
+            "path": str(target),
+        }
+    session.set_default_cwd(target)
+    return {
+        "success": True,
+        "session_cwd": str(target),
+        "workspace_root": str(WORKSPACE_ROOT),
+        "cleared": False,
+    }
+
+
+@mcp.tool(
+    name="get_default_cwd",
+    description=(
+        "Return the currently active default working directory and whether it comes "
+        "from the session override (set_default_cwd) or from the server's workspace root."
+    ),
+)
+def get_default_cwd() -> dict[str, object]:
+    session_cwd = session.get_default_cwd()
+    effective = session_cwd if session_cwd is not None else WORKSPACE_ROOT
+    return {
+        "success": True,
+        "session_cwd": str(session_cwd) if session_cwd else None,
+        "workspace_root": str(WORKSPACE_ROOT),
+        "effective_cwd": str(effective),
+        "source": "session" if session_cwd else "workspace_root",
+    }
+
+
+@mcp.tool(
     name="git_status",
     description="Return structured git status for the repository at cwd or the current workspace root.",
 )
@@ -243,30 +388,60 @@ def git_status(cwd: str | None = None) -> dict[str, object]:
 
 @mcp.tool(
     name="git_diff",
-    description="Return git diff output and changed file paths for the repository at cwd.",
+    description=(
+        "Return git diff output plus per-file diffs with added/removed counts. "
+        "Each file is truncated independently to per_file_max_bytes so a single huge "
+        "file does not hide changes in other files."
+    ),
 )
 def git_diff(
     cwd: str | None = None,
     staged: bool = False,
     paths: list[str] | None = None,
     max_bytes: int = 65536,
+    per_file_max_bytes: int = 16384,
 ) -> dict[str, object]:
     resolved_cwd = resolve_cwd(cwd, WORKSPACE_ROOT)
-    return git_diff_impl(cwd=resolved_cwd, staged=staged, paths=paths, max_bytes=max_bytes)
+    return git_diff_impl(
+        cwd=resolved_cwd,
+        staged=staged,
+        paths=paths,
+        max_bytes=max_bytes,
+        per_file_max_bytes=per_file_max_bytes,
+    )
 
 
 @mcp.tool(
     name="git_commit",
-    description="Create a git commit for staged changes, selected paths, or all current changes.",
+    description=(
+        "Create a git commit for staged changes, selected paths, or all current changes. "
+        "Supports amend (rewrite HEAD), allow_empty (commit without changes), custom author, "
+        "sign_off (append Signed-off-by trailer), and dry_run preview."
+    ),
 )
 def git_commit(
     message: str,
     cwd: str | None = None,
     paths: list[str] | None = None,
     stage_all: bool = False,
+    amend: bool = False,
+    allow_empty: bool = False,
+    author: str | None = None,
+    sign_off: bool = False,
+    dry_run: bool = False,
 ) -> dict[str, object]:
     resolved_cwd = resolve_cwd(cwd, WORKSPACE_ROOT)
-    return git_commit_impl(cwd=resolved_cwd, message=message, paths=paths, stage_all=stage_all)
+    return git_commit_impl(
+        cwd=resolved_cwd,
+        message=message,
+        paths=paths,
+        stage_all=stage_all,
+        amend=amend,
+        allow_empty=allow_empty,
+        author=author,
+        sign_off=sign_off,
+        dry_run=dry_run,
+    )
 
 
 @mcp.tool(
@@ -276,6 +451,52 @@ def git_commit(
 def git_log(cwd: str | None = None, limit: int = 10) -> dict[str, object]:
     resolved_cwd = resolve_cwd(cwd, WORKSPACE_ROOT)
     return git_log_impl(cwd=resolved_cwd, limit=limit)
+
+
+@mcp.tool(
+    name="git_show",
+    description=(
+        "Show metadata + per-file diff for a commit or any git ref (defaults to HEAD). "
+        "Useful for inspecting a specific commit without shelling out."
+    ),
+)
+def git_show(
+    ref: str = "HEAD",
+    cwd: str | None = None,
+    max_bytes: int = 65536,
+    per_file_max_bytes: int = 16384,
+) -> dict[str, object]:
+    resolved_cwd = resolve_cwd(cwd, WORKSPACE_ROOT)
+    return git_show_impl(
+        cwd=resolved_cwd,
+        ref=ref,
+        max_bytes=max_bytes,
+        per_file_max_bytes=per_file_max_bytes,
+    )
+
+
+@mcp.tool(
+    name="git_blame",
+    description=(
+        "Return per-line blame info (commit, author, summary, content) for a file. "
+        "Restrict to a line range via start_line / end_line."
+    ),
+)
+def git_blame(
+    path: str,
+    cwd: str | None = None,
+    ref: str | None = None,
+    start_line: int | None = None,
+    end_line: int | None = None,
+) -> dict[str, object]:
+    resolved_cwd = resolve_cwd(cwd, WORKSPACE_ROOT)
+    return git_blame_impl(
+        cwd=resolved_cwd,
+        path=path,
+        ref=ref,
+        start_line=start_line,
+        end_line=end_line,
+    )
 
 
 @mcp.tool(
@@ -304,10 +525,36 @@ def run_command(
 
 
 @mcp.tool(
+    name="run_command_stream",
+    description=(
+        "Start a shell command in background and return task_id immediately for "
+        "stream-like polling via get_task/wait_task."
+    ),
+)
+def run_command_stream(
+    command: str,
+    cwd: str | None = None,
+    timeout: int | None = None,
+) -> dict[str, object]:
+    resolved_cwd = resolve_cwd(cwd, WORKSPACE_ROOT)
+    effective_timeout = timeout if timeout is not None else COMMAND_TIMEOUT
+    queued = registry.submit_command(
+        command=command,
+        cwd=resolved_cwd,
+        timeout=effective_timeout,
+    )
+    queued["stream_mode"] = "task-polling"
+    queued["next"] = "call get_task(task_id) or wait_task(task_id)"
+    return queued
+
+
+@mcp.tool(
     name="delegate_task",
     description=(
         "Fallback only. Use this when direct tools are insufficient for a complex, long-running, or "
-        "multi-file task. Supported executors: auto, codex, claude-code."
+        "multi-file task. Supported executors: auto, codex, claude-code. "
+        "Optionally provide output_schema and parse_structured_output=true to "
+        "capture JSON output as structured_output."
     ),
 )
 def delegate_task(
@@ -320,6 +567,8 @@ def delegate_task(
     verification_commands: list[str] | None = None,
     commit_mode: str = "allowed",
     timeout: int | None = None,
+    output_schema: dict[str, object] | None = None,
+    parse_structured_output: bool = True,
 ) -> dict[str, object]:
     resolved_cwd = resolve_cwd(cwd, WORKSPACE_ROOT)
     return registry.submit(
@@ -332,6 +581,8 @@ def delegate_task(
         acceptance_criteria=acceptance_criteria,
         verification_commands=verification_commands,
         commit_mode=commit_mode,
+        output_schema=output_schema,
+        parse_structured_output=parse_structured_output,
     )
 
 
@@ -359,10 +610,36 @@ def cancel_task(task_id: str) -> dict[str, object]:
     return registry.cancel(task_id)
 
 
+@mcp.tool(
+    name="purge_tasks",
+    description=(
+        "Delete old task metadata/log directories under STATE_DIR/tasks. "
+        "Defaults to 7 days; supports dry_run preview."
+    ),
+)
+def purge_tasks(older_than_hours: float = 24 * 7, dry_run: bool = False) -> dict[str, object]:
+    return store.purge_tasks(
+        older_than_seconds=max(float(older_than_hours), 0.0) * 3600.0,
+        dry_run=dry_run,
+    )
+
+
 def build_http_app():
-    return mcp.http_app(
+    streamable_app = mcp.http_app(
         path="/mcp",
         transport="streamable-http",
+    )
+    legacy_sse_app = mcp.http_app(
+        path="/mcp",
+        transport="sse",
+    )
+    return build_http_compat_app(
+        streamable_app=streamable_app,
+        legacy_sse_app=legacy_sse_app,
+        app_name=APP_NAME,
+        mcp_path="/mcp",
+        get_auth_token=_current_auth_token,
+        instructions=MCP_INSTRUCTIONS,
     )
 
 

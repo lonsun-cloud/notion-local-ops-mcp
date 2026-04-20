@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import shutil
 import threading
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 
@@ -102,3 +103,56 @@ class TaskStore:
     def read_summary(self, task_id: str) -> str:
         with self._lock:
             return self._summary_path(task_id).read_text(encoding="utf-8").strip()
+
+    def purge_tasks(self, *, older_than_seconds: float, dry_run: bool = False) -> dict[str, object]:
+        """Remove task directories whose ``updated_at`` is older than the threshold."""
+        now = datetime.now(UTC)
+        cutoff = now - timedelta(seconds=max(float(older_than_seconds), 0.0))
+        tasks_root = self.root / "tasks"
+        scanned = 0
+        purged = 0
+        purged_ids: list[str] = []
+
+        with self._lock:
+            if not tasks_root.exists():
+                return {
+                    "success": True,
+                    "scanned": 0,
+                    "purged": 0,
+                    "task_ids": [],
+                    "dry_run": dry_run,
+                    "cutoff": cutoff.isoformat(),
+                }
+            for task_dir in sorted(tasks_root.iterdir()):
+                if not task_dir.is_dir():
+                    continue
+                scanned += 1
+                task_id = task_dir.name
+                meta_path = task_dir / "meta.json"
+                should_purge = False
+                try:
+                    payload = json.loads(meta_path.read_text(encoding="utf-8"))
+                    updated_raw = str(payload.get("updated_at") or payload.get("created_at") or "")
+                    updated_at = datetime.fromisoformat(updated_raw.replace("Z", "+00:00"))
+                    if updated_at.tzinfo is None:
+                        updated_at = updated_at.replace(tzinfo=UTC)
+                    should_purge = updated_at < cutoff
+                except Exception:
+                    # Corrupt/partial task directories can be cleaned up as stale.
+                    should_purge = True
+
+                if not should_purge:
+                    continue
+                purged += 1
+                purged_ids.append(task_id)
+                if not dry_run:
+                    shutil.rmtree(task_dir, ignore_errors=True)
+
+        return {
+            "success": True,
+            "scanned": scanned,
+            "purged": purged,
+            "task_ids": purged_ids,
+            "dry_run": dry_run,
+            "cutoff": cutoff.isoformat(),
+        }

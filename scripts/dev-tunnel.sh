@@ -131,16 +131,6 @@ trap cleanup EXIT INT TERM
 require_command cloudflared
 
 # --- Python virtual environment bootstrap ---
-ensure_deps() {
-  if ! command -v notion-local-ops-mcp >/dev/null 2>&1 || ! python - <<'PY' >/dev/null 2>&1
-import fastmcp
-import uvicorn
-PY
-  then
-    python -m pip install -r requirements.txt
-    python -m pip install -e .
-  fi
-}
 
 if [[ -n "${NOTION_LOCAL_OPS_VENV_PATH:-}" ]]; then
   # Non-interactive: env var skips the prompt (for CI / automation)
@@ -187,7 +177,13 @@ if sys.version_info < (3, 11):
     raise SystemExit("Python 3.11+ is required.")
 PY
 
-ensure_deps
+if ! command -v notion-local-ops-mcp >/dev/null 2>&1 || ! python - <<'PY' >/dev/null 2>&1
+import fastmcp
+import uvicorn
+PY
+then
+  python -m pip install -e .
+fi
 
 OVERRIDE_HOST="${NOTION_LOCAL_OPS_HOST:-}"
 OVERRIDE_PORT="${NOTION_LOCAL_OPS_PORT:-}"
