@@ -173,6 +173,8 @@ foreach ($name in @(
 Require-Command cloudflared
 
 # --- Python virtual environment bootstrap ---
+$DefaultVenvDir = Join-Path $RootDir '.venv'
+
 if ($env:NOTION_LOCAL_OPS_VENV_PATH) {
     # Non-interactive: env var skips the prompt (for CI / automation)
     $VenvDir = Resolve-RepoPath $env:NOTION_LOCAL_OPS_VENV_PATH
@@ -181,7 +183,16 @@ if ($env:NOTION_LOCAL_OPS_VENV_PATH) {
         Write-Error "Invalid venv path: $VenvDir (Scripts\python.exe not found)"
         exit 1
     }
+} elseif (Test-Path -LiteralPath $DefaultVenvDir) {
+    # Existing .venv found — reuse silently (no prompt on subsequent runs)
+    $VenvDir = $DefaultVenvDir
+    $VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
+    if (-not (Test-Path -LiteralPath $VenvPython)) {
+        Write-Error "venv python not found at $VenvPython"
+        exit 1
+    }
 } else {
+    # First run: no .venv exists, ask the user
     $hasVenv = Read-Host "Do you have an existing Python virtual environment? [y/N]"
     if ($hasVenv -match '^[Yy]') {
         $userVenvPath = Read-Host "Enter your virtual environment path (e.g. C:\Users\you\myenv)"
@@ -193,12 +204,10 @@ if ($env:NOTION_LOCAL_OPS_VENV_PATH) {
         }
     } else {
         $PythonBin = Pick-Python
-        $VenvDir   = Join-Path $RootDir '.venv'
-        if (-not (Test-Path -LiteralPath $VenvDir)) {
-            Write-Host "Creating virtual environment at $VenvDir..."
-            & $PythonBin -m venv $VenvDir
-            if ($LASTEXITCODE -ne 0) { Write-Error "Failed to create venv"; exit 1 }
-        }
+        $VenvDir   = $DefaultVenvDir
+        Write-Host "Creating virtual environment at $VenvDir..."
+        & $PythonBin -m venv $VenvDir
+        if ($LASTEXITCODE -ne 0) { Write-Error "Failed to create venv"; exit 1 }
         $VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
         if (-not (Test-Path -LiteralPath $VenvPython)) {
             Write-Error "venv python not found at $VenvPython"

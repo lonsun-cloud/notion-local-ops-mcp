@@ -151,7 +151,12 @@ if [[ -n "${NOTION_LOCAL_OPS_VENV_PATH:-}" ]]; then
   fi
   # shellcheck disable=SC1091
   source "${VENV_DIR}/bin/activate"
+elif [[ -d "${ROOT_DIR}/.venv" ]]; then
+  # Existing .venv found — reuse silently (no prompt on subsequent runs)
+  # shellcheck disable=SC1091
+  source "${ROOT_DIR}/.venv/bin/activate"
 else
+  # First run: no .venv exists, ask the user
   read -rp "Do you have an existing Python virtual environment? [y/N]: " HAS_VENV
   case "${HAS_VENV}" in
     [Yy]*)
@@ -167,10 +172,8 @@ else
     *)
       PYTHON_BIN="$(pick_python)"
       VENV_DIR="${ROOT_DIR}/.venv"
-      if [[ ! -d "${VENV_DIR}" ]]; then
-        echo "Creating virtual environment at ${VENV_DIR}..."
-        "${PYTHON_BIN}" -m venv "${VENV_DIR}"
-      fi
+      echo "Creating virtual environment at ${VENV_DIR}..."
+      "${PYTHON_BIN}" -m venv "${VENV_DIR}"
       # shellcheck disable=SC1091
       source "${VENV_DIR}/bin/activate"
       ;;
@@ -241,7 +244,7 @@ if [[ -z "${NOTION_LOCAL_OPS_AUTH_TOKEN:-}" ]]; then
   exit 1
 fi
 
-SERVER_URL="http://${NOTION_LOCAL_OPS_HOST}:${NOTION_LOCAL_OPS_PORT}"
+SERVER_URL="{{http://${NOTION_LOCAL_OPS_HOST}}}:${NOTION_LOCAL_OPS_PORT}"
 SERVER_LOG="${TMPDIR:-/tmp}/notion-local-ops-mcp-server.$$.log"
 
 echo "Starting notion-local-ops-mcp..."
