@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import socket
 import threading
 import time
@@ -9,9 +10,14 @@ from pathlib import Path
 import anyio
 import httpx
 import uvicorn
+from starlette.applications import Starlette
+from starlette.middleware import Middleware as StarletteMiddleware
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from notion_local_ops_mcp import server
+from notion_local_ops_mcp.http_compat import MCPDebugLoggingMiddleware
 from notion_local_ops_mcp.server import build_http_app
 
 
@@ -153,16 +159,6 @@ def test_http_app_rejects_unauthenticated_plain_get(monkeypatch) -> None:
     assert response.status_code == 401
 
 
-def test_http_app_rejects_unauthenticated_head(monkeypatch) -> None:
-    monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
-    app = build_http_app()
-
-    with TestClient(app) as client:
-        response = client.head("/mcp")
-
-    assert response.status_code == 401
-
-
 def test_http_app_rejects_unauthenticated_messages_post(monkeypatch) -> None:
     monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
     app = build_http_app()
@@ -187,6 +183,17 @@ def test_http_app_allows_discovery_without_token(monkeypatch) -> None:
     assert response.status_code == 200
 
 
+def test_http_app_allows_unauthenticated_head_probe(monkeypatch) -> None:
+    monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    app = build_http_app()
+
+    with TestClient(app) as client:
+        response = client.head("/mcp")
+
+    assert response.status_code == 204
+    assert response.headers["allow"] == "GET, POST, DELETE, HEAD, OPTIONS"
+
+
 def test_http_app_accepts_valid_bearer_on_head(monkeypatch) -> None:
     monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
     app = build_http_app()
@@ -195,6 +202,16 @@ def test_http_app_accepts_valid_bearer_on_head(monkeypatch) -> None:
         response = client.head("/mcp", headers={"Authorization": "Bearer secret-token"})
 
     assert response.status_code == 204
+
+
+def test_http_app_does_not_require_auth_for_oauth_discovery_probe(monkeypatch) -> None:
+    monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    app = build_http_app()
+
+    with TestClient(app) as client:
+        response = client.get("/.well-known/oauth-authorization-server")
+
+    assert response.status_code == 404
 
 
 def test_http_app_supports_legacy_sse_get_on_mcp(tmp_path, monkeypatch) -> None:
@@ -208,5 +225,63 @@ def test_http_app_supports_legacy_sse_get_on_mcp(tmp_path, monkeypatch) -> None:
                 ) as response:
                     assert response.status_code == 200
                     assert response.headers["content-type"].startswith("text/event-stream")
+
+        anyio.run(scenario)
+
+
+def test_debug_logging_middleware_logs_rpc_method_and_preserves_body(caplog) -> None:
+    async def echo_json(request) -> JSONResponse:
+        return JSONResponse(await request.json())
+
+    app = Starlette(
+        routes=[Route("/mcp", endpoint=echo_json, methods=["POST"])],
+        middleware=[
+            StarletteMiddleware(
+                MCPDebugLoggingMiddleware,
+                get_debug_enabled=lambda: True,
+                mcp_path="/mcp",
+            )
+        ],
+    )
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "search", "arguments": {"mode": "text", "query": "TODO"}},
+    }
+
+    caplog.set_level(logging.INFO, logger="notion_local_ops_mcp.mcp_debug")
+    with TestClient(app) as client:
+        response = client.post("/mcp", json=payload, headers={"mcp-session-id": "sess-123"})
+
+    assert response.status_code == 200
+    assert response.json() == payload
+    messages = [record.message for record in caplog.records if record.name == "notion_local_ops_mcp.mcp_debug"]
+    assert any("phase=request" in message and '"method":"tools/call"' in message for message in messages)
+    assert any('"tool":"search"' in message for message in messages)
+    assert any('"tool_args":"{\\"mode\\":\\"text\\",\\"query\\":\\"TODO\\"}"' in message for message in messages)
+    assert any("phase=response_end" in message and "status=200" in message for message in messages)
+
+
+def test_http_app_debug_logging_does_not_break_streamable_http_initialize(tmp_path, monkeypatch) -> None:
+    from mcp.client.session import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+
+    monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    monkeypatch.setattr(server, "DEBUG_MCP_LOGGING", True)
+
+    with _running_server(tmp_path, monkeypatch) as url:
+
+        async def scenario() -> None:
+            headers = {"Authorization": "Bearer secret-token"}
+            async with httpx.AsyncClient(headers=headers, timeout=10.0) as client:
+                async with streamable_http_client(url, http_client=client) as (
+                    read_stream,
+                    write_stream,
+                    _,
+                ):
+                    async with ClientSession(read_stream, write_stream) as session:
+                        await session.initialize()
 
         anyio.run(scenario)

@@ -4,26 +4,36 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+ACTION="${1:-start}"
+SUPERVISOR_PID=""
+SERVER_LOG=""
+
 usage() {
   cat <<'EOF'
-Usage: ./scripts/dev-tunnel.sh
-
-Starts the local MCP server and exposes it with cloudflared.
+Usage:
+  ./scripts/dev-tunnel.sh            # start supervisor + local MCP server + cloudflared tunnel
+  ./scripts/dev-tunnel.sh start      # same as above
+  ./scripts/dev-tunnel.sh reload     # rolling-reload the local MCP server without dropping the tunnel
+  ./scripts/dev-tunnel.sh status     # show supervisor / endpoint status
+  ./scripts/dev-tunnel.sh --help
 
 Environment loading order:
 1. .env in the repository root
 2. Current shell environment overrides matching keys
 
-Required:
+Required for start:
 - NOTION_LOCAL_OPS_AUTH_TOKEN
 
 Optional:
 - NOTION_LOCAL_OPS_WORKSPACE_ROOT (defaults to repo root)
 - NOTION_LOCAL_OPS_HOST (defaults to 127.0.0.1)
 - NOTION_LOCAL_OPS_PORT (defaults to 8766)
+- NOTION_LOCAL_OPS_STATE_DIR (defaults to ~/.notion-local-ops-mcp)
 - NOTION_LOCAL_OPS_CLOUDFLARED_CONFIG (named tunnel config path)
 - NOTION_LOCAL_OPS_TUNNEL_NAME (optional override for cloudflared tunnel run)
 - NOTION_LOCAL_OPS_VENV_PATH (skip venv prompt; use this path directly)
+- NOTION_LOCAL_OPS_DEBUG_MCP_LOGGING (set to 1/true/on to log MCP methods/tools)
+- NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS (drain time during rolling reload; default 30)
 
 If ./cloudflared.local.yml or ./cloudflared.local.yaml exists, this script
 uses that named tunnel config automatically. Otherwise it falls back to a
@@ -114,76 +124,72 @@ PY
 cleanup() {
   local exit_code=$?
   trap - EXIT INT TERM
-  if [[ -n "${SERVER_PID:-}" ]] && kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
-    kill "${SERVER_PID}" >/dev/null 2>&1 || true
-    wait "${SERVER_PID}" 2>/dev/null || true
+  if [[ -n "${SUPERVISOR_PID:-}" ]] && kill -0 "${SUPERVISOR_PID}" >/dev/null 2>&1; then
+    kill "${SUPERVISOR_PID}" >/dev/null 2>&1 || true
+    wait "${SUPERVISOR_PID}" 2>/dev/null || true
   fi
   exit "${exit_code}"
 }
 
-if [[ "${1:-}" == "--help" ]]; then
+supervisor_pid() {
+  if [[ ! -f "${SUPERVISOR_PID_FILE}" ]]; then
+    return 1
+  fi
+  tr -d '[:space:]' <"${SUPERVISOR_PID_FILE}"
+}
+
+supervisor_running() {
+  local pid
+  pid="$(supervisor_pid 2>/dev/null || true)"
+  if [[ -z "${pid}" ]]; then
+    return 1
+  fi
+  if ! kill -0 "${pid}" >/dev/null 2>&1; then
+    return 1
+  fi
+  printf '%s\n' "${pid}"
+}
+
+print_status() {
+  local pid
+  if pid="$(supervisor_running)"; then
+    echo "Supervisor running: pid=${pid}"
+    ps -o pid,ppid,lstart,etime,command -p "${pid}"
+  else
+    echo "Supervisor not running"
+  fi
+
+  echo "Endpoint: http://${NOTION_LOCAL_OPS_HOST}:${NOTION_LOCAL_OPS_PORT}/mcp"
+  if command -v curl >/dev/null 2>&1; then
+    if curl -fsSI "http://${NOTION_LOCAL_OPS_HOST}:${NOTION_LOCAL_OPS_PORT}/mcp" >/dev/null 2>&1; then
+      echo "Local MCP endpoint is reachable"
+    else
+      echo "Local MCP endpoint is not reachable"
+    fi
+  fi
+
+  if [[ -n "${SERVER_LOG:-}" ]]; then
+    echo "Current server log: ${SERVER_LOG}"
+  fi
+  echo "Supervisor pid file: ${SUPERVISOR_PID_FILE}"
+}
+
+if [[ "${ACTION}" == "--help" || "${ACTION}" == "-h" ]]; then
   usage
   exit 0
 fi
 
-trap cleanup EXIT INT TERM
-
-require_command cloudflared
-
-# --- Python virtual environment bootstrap ---
-
-if [[ -n "${NOTION_LOCAL_OPS_VENV_PATH:-}" ]]; then
-  # Non-interactive: env var skips the prompt (for CI / automation)
-  VENV_DIR="$(resolve_path "${NOTION_LOCAL_OPS_VENV_PATH}")"
-  if [[ ! -f "${VENV_DIR}/bin/python" ]]; then
-    echo "Invalid venv path: ${VENV_DIR} (bin/python not found)" >&2
-    exit 1
-  fi
-  # shellcheck disable=SC1091
-  source "${VENV_DIR}/bin/activate"
-elif [[ -d "${ROOT_DIR}/.venv" ]]; then
-  # Existing .venv found — reuse silently (no prompt on subsequent runs)
-  # shellcheck disable=SC1091
-  source "${ROOT_DIR}/.venv/bin/activate"
-else
-  # First run: no .venv exists, ask the user
-  read -rp "Do you have an existing Python virtual environment? [y/N]: " HAS_VENV
-  case "${HAS_VENV}" in
-    [Yy]*)
-      read -rp "Enter your virtual environment path (e.g. /home/user/myenv): " USER_VENV_PATH
-      VENV_DIR="$(resolve_path "${USER_VENV_PATH}")"
-      if [[ ! -f "${VENV_DIR}/bin/python" ]]; then
-        echo "Invalid venv path: ${VENV_DIR} (bin/python not found)" >&2
-        exit 1
-      fi
-      # shellcheck disable=SC1091
-      source "${VENV_DIR}/bin/activate"
-      ;;
-    *)
-      PYTHON_BIN="$(pick_python)"
-      VENV_DIR="${ROOT_DIR}/.venv"
-      echo "Creating virtual environment at ${VENV_DIR}..."
-      "${PYTHON_BIN}" -m venv "${VENV_DIR}"
-      # shellcheck disable=SC1091
-      source "${VENV_DIR}/bin/activate"
-      ;;
-  esac
+if [[ $# -gt 1 ]]; then
+  usage >&2
+  exit 1
 fi
 
-python - <<'PY'
-import sys
-
-if sys.version_info < (3, 11):
-    raise SystemExit("Python 3.11+ is required.")
-PY
-
-if ! command -v notion-local-ops-mcp >/dev/null 2>&1 || ! python - <<'PY' >/dev/null 2>&1
-import fastmcp
-import uvicorn
-PY
-then
-  python -m pip install -e .
+if [[ "${ACTION}" != "start" && "${ACTION}" != "reload" && "${ACTION}" != "status" ]]; then
+  usage >&2
+  exit 1
 fi
+
+PYTHON_BIN="$(pick_python)"
 
 OVERRIDE_HOST="${NOTION_LOCAL_OPS_HOST:-}"
 OVERRIDE_PORT="${NOTION_LOCAL_OPS_PORT:-}"
@@ -196,16 +202,15 @@ OVERRIDE_CODEX_COMMAND="${NOTION_LOCAL_OPS_CODEX_COMMAND:-}"
 OVERRIDE_CLAUDE_COMMAND="${NOTION_LOCAL_OPS_CLAUDE_COMMAND:-}"
 OVERRIDE_COMMAND_TIMEOUT="${NOTION_LOCAL_OPS_COMMAND_TIMEOUT:-}"
 OVERRIDE_DELEGATE_TIMEOUT="${NOTION_LOCAL_OPS_DELEGATE_TIMEOUT:-}"
+OVERRIDE_DEBUG_MCP_LOGGING="${NOTION_LOCAL_OPS_DEBUG_MCP_LOGGING:-}"
+OVERRIDE_GRACEFUL_SHUTDOWN_SECONDS="${NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS:-}"
 
 load_env_file
 
 export NOTION_LOCAL_OPS_HOST="${OVERRIDE_HOST:-${NOTION_LOCAL_OPS_HOST:-127.0.0.1}}"
 export NOTION_LOCAL_OPS_PORT="${OVERRIDE_PORT:-${NOTION_LOCAL_OPS_PORT:-8766}}"
 export NOTION_LOCAL_OPS_WORKSPACE_ROOT="${OVERRIDE_WORKSPACE_ROOT:-${NOTION_LOCAL_OPS_WORKSPACE_ROOT:-${ROOT_DIR}}}"
-
-if [[ -n "${OVERRIDE_STATE_DIR}" ]]; then
-  export NOTION_LOCAL_OPS_STATE_DIR="${OVERRIDE_STATE_DIR}"
-fi
+export NOTION_LOCAL_OPS_STATE_DIR="${OVERRIDE_STATE_DIR:-${NOTION_LOCAL_OPS_STATE_DIR:-${HOME}/.notion-local-ops-mcp}}"
 
 if [[ -n "${OVERRIDE_AUTH_TOKEN}" ]]; then
   export NOTION_LOCAL_OPS_AUTH_TOKEN="${OVERRIDE_AUTH_TOKEN}"
@@ -235,17 +240,80 @@ if [[ -n "${OVERRIDE_DELEGATE_TIMEOUT}" ]]; then
   export NOTION_LOCAL_OPS_DELEGATE_TIMEOUT="${OVERRIDE_DELEGATE_TIMEOUT}"
 fi
 
+if [[ -n "${OVERRIDE_DEBUG_MCP_LOGGING}" ]]; then
+  export NOTION_LOCAL_OPS_DEBUG_MCP_LOGGING="${OVERRIDE_DEBUG_MCP_LOGGING}"
+fi
+
+if [[ -n "${OVERRIDE_GRACEFUL_SHUTDOWN_SECONDS}" ]]; then
+  export NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS="${OVERRIDE_GRACEFUL_SHUTDOWN_SECONDS}"
+fi
+
+SUPERVISOR_PID_FILE="${NOTION_LOCAL_OPS_STATE_DIR}/dev-tunnel-supervisor.pid"
+SERVER_LOG="$(ls -1t ${TMPDIR:-/tmp}/notion-local-ops-mcp-server.*.log 2>/dev/null | head -n1 || true)"
+
+case "${ACTION}" in
+  reload)
+    if ! pid="$(supervisor_running)"; then
+      echo "No running dev-tunnel supervisor found. Start one with ./scripts/dev-tunnel.sh" >&2
+      exit 1
+    fi
+    kill -HUP "${pid}"
+    echo "Sent rolling-reload signal to supervisor pid=${pid}"
+    exit 0
+    ;;
+  status)
+    print_status
+    exit 0
+    ;;
+  start)
+    ;;
+esac
+
+trap cleanup EXIT INT TERM
+
+require_command cloudflared
+if [[ ! -d "${ROOT_DIR}/.venv" ]]; then
+  "${PYTHON_BIN}" -m venv "${ROOT_DIR}/.venv"
+fi
+
+# shellcheck disable=SC1091
+source "${ROOT_DIR}/.venv/bin/activate"
+
+python - <<'PY'
+import sys
+
+if sys.version_info < (3, 11):
+    raise SystemExit("Python 3.11+ is required.")
+PY
+
+if ! command -v notion-local-ops-mcp >/dev/null 2>&1 || ! python - <<'PY' >/dev/null 2>&1
+import fastmcp
+import uvicorn
+import notion_local_ops_mcp.supervisor
+PY
+then
+  python -m pip install -e .
+fi
+
 if [[ -z "${NOTION_LOCAL_OPS_AUTH_TOKEN:-}" ]]; then
   echo "Missing NOTION_LOCAL_OPS_AUTH_TOKEN. Set it in .env or export it before running." >&2
   exit 1
 fi
 
-SERVER_URL="{{http://${NOTION_LOCAL_OPS_HOST}}}:${NOTION_LOCAL_OPS_PORT}"
+if pid="$(supervisor_running)"; then
+  echo "A dev-tunnel supervisor is already running (pid=${pid})." >&2
+  echo "Use ./scripts/dev-tunnel.sh reload to restart the local MCP server without dropping the tunnel." >&2
+  exit 1
+fi
+
+SERVER_URL="http://${NOTION_LOCAL_OPS_HOST}:${NOTION_LOCAL_OPS_PORT}"
 SERVER_LOG="${TMPDIR:-/tmp}/notion-local-ops-mcp-server.$$.log"
 
-echo "Starting notion-local-ops-mcp..."
-notion-local-ops-mcp >"${SERVER_LOG}" 2>&1 &
-SERVER_PID=$!
+echo "Starting notion-local-ops-mcp supervisor..."
+python -m notion_local_ops_mcp.supervisor \
+  --pid-file "${SUPERVISOR_PID_FILE}" \
+  --log-file "${SERVER_LOG}" &
+SUPERVISOR_PID=$!
 
 if ! wait_for_server; then
   echo "MCP server did not become ready. Recent log output:" >&2
@@ -255,7 +323,11 @@ fi
 
 echo "MCP endpoint: ${SERVER_URL}/mcp"
 echo "Workspace root: ${NOTION_LOCAL_OPS_WORKSPACE_ROOT}"
+echo "State dir: ${NOTION_LOCAL_OPS_STATE_DIR}"
+echo "Supervisor pid: ${SUPERVISOR_PID}"
+echo "Supervisor pid file: ${SUPERVISOR_PID_FILE}"
 echo "Server log: ${SERVER_LOG}"
+echo "Rolling reload command: ./scripts/dev-tunnel.sh reload"
 
 if CLOUDFLARED_CONFIG="$(pick_cloudflared_config)"; then
   if [[ ! -f "${CLOUDFLARED_CONFIG}" ]]; then

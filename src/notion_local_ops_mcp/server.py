@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from fastmcp import FastMCP
+import argparse
+import os
 import re
+
+from fastmcp import FastMCP
 import uvicorn
 
 from .http_compat import build_http_compat_app
@@ -12,7 +15,9 @@ from .config import (
     CLAUDE_COMMAND,
     CODEX_COMMAND,
     COMMAND_TIMEOUT,
+    DEBUG_MCP_LOGGING,
     DELEGATE_TIMEOUT,
+    GRACEFUL_SHUTDOWN_SECONDS,
     HOST,
     PORT,
     STATE_DIR,
@@ -52,7 +57,10 @@ registry = ExecutorRegistry(
 )
 
 MCP_INSTRUCTIONS = (
-    "Use direct tools first for normal tasks: list/glob/grep/read/replace/write/patch/git/run. "
+    "Use direct tools first for normal tasks. Prioritize apply_patch/write_file for edits and "
+    "run_command_stream/wait_task for long-running shell work. "
+    "Use search/read_text for focused repo discovery and reading, not as a substitute for every shell step. "
+    "Use git_* only when the current cwd is actually inside a git repository. "
     "Use delegate_task only when direct tools are insufficient for a complex, long-running, or multi-file task."
 )
 
@@ -68,21 +76,34 @@ def _current_auth_token() -> str:
     return globals().get("AUTH_TOKEN", "") or ""
 
 
+def _current_debug_mcp_logging() -> bool:
+    return bool(globals().get("DEBUG_MCP_LOGGING", False))
+
+
 @mcp.tool(
     name="list_skills",
     description=(
         "List project and global agent skills as lightweight summaries. "
-        "Returns skill name, description, preferred path, and source locations."
+        "Returns skill name, description, preferred path, and source locations. "
+        "Use namespace ('agents' | 'codex' | 'claude') to scope, name_pattern "
+        "(fnmatch, e.g. 'git-*') to filter by skill name, and "
+        "description_max_length to cap long descriptions for index-style scans."
     ),
 )
 def list_skills(
     include_project: bool = True,
     include_global: bool = True,
+    namespace: str | None = None,
+    name_pattern: str | None = None,
+    description_max_length: int | None = None,
 ) -> dict[str, object]:
     return list_skills_impl(
         workspace_root=WORKSPACE_ROOT,
         include_project=include_project,
         include_global=include_global,
+        namespace=namespace,
+        name_pattern=name_pattern,
+        description_max_length=description_max_length,
     )
 
 
@@ -122,7 +143,8 @@ def list_files(
     description=(
         "Canonical search tool that unifies glob, regex grep, and plain-text search. "
         "Use mode='glob' for path discovery, mode='regex' for code/text regex, and "
-        "mode='text' for literal substring search."
+        "mode='text' for literal substring search. Hidden entries and .gitignore'd "
+        "paths are excluded by default; regex/text search also accept a single file path."
     ),
 )
 def search(
@@ -138,6 +160,9 @@ def search(
     limit: int = 200,
     offset: int = 0,
     multiline: bool = False,
+    include_hidden: bool = False,
+    respect_gitignore: bool = True,
+    exclude_patterns: list[str] | None = None,
 ) -> dict[str, object]:
     target = resolve_path(path or ".", WORKSPACE_ROOT)
 
@@ -147,7 +172,15 @@ def search(
                 "success": False,
                 "error": {"code": "missing_pattern", "message": "mode=glob requires `pattern`."},
             }
-        result = glob_files_impl(target, pattern=pattern, limit=limit, offset=offset)
+        result = glob_files_impl(
+            target,
+            pattern=pattern,
+            limit=limit,
+            offset=offset,
+            include_hidden=include_hidden,
+            respect_gitignore=respect_gitignore,
+            exclude_patterns=exclude_patterns,
+        )
         if isinstance(result, dict):
             result["mode"] = mode
         return result
@@ -181,6 +214,9 @@ def search(
             head_limit=limit,
             offset=offset,
             multiline=multiline,
+            include_hidden=include_hidden,
+            respect_gitignore=respect_gitignore,
+            exclude_patterns=exclude_patterns,
         )
         if isinstance(result, dict):
             result["mode"] = mode
@@ -201,7 +237,8 @@ def search(
     name="read_text",
     description=(
         "Canonical text-reader tool. Pass either `path` for single-file reads or "
-        "`paths` for batch reads. Pagination is line-based via start_line/line_limit."
+        "`paths` for batch reads. Pagination is line-based via start_line/line_limit. "
+        "Set include_line_numbers=true when evidence or code-review output needs numbered lines."
     ),
 )
 def read_text(
@@ -209,6 +246,7 @@ def read_text(
     paths: list[str] | None = None,
     start_line: int | None = None,
     line_limit: int | None = None,
+    include_line_numbers: bool = False,
 ) -> dict[str, object]:
     has_path = bool(path)
     has_paths = bool(paths)
@@ -231,6 +269,7 @@ def read_text(
             limit=effective_limit,
             max_lines=200,
             max_bytes=32768,
+            include_line_numbers=include_line_numbers,
         )
         if isinstance(result, dict):
             result["mode"] = "single"
@@ -243,6 +282,7 @@ def read_text(
         limit=effective_limit,
         max_lines=200,
         max_bytes=32768,
+        include_line_numbers=include_line_numbers,
     )
     if isinstance(result, dict):
         result["mode"] = "batch"
@@ -305,6 +345,7 @@ async def server_info() -> dict[str, object]:
         "command_timeout_seconds": COMMAND_TIMEOUT,
         "delegate_timeout_seconds": DELEGATE_TIMEOUT,
         "auth": "bearer" if AUTH_TOKEN else "none",
+        "debug_mcp_logging": bool(DEBUG_MCP_LOGGING),
         "codex_command": CODEX_COMMAND,
         "claude_command": CLAUDE_COMMAND,
         "tools": tools,
@@ -639,19 +680,75 @@ def build_http_app():
         app_name=APP_NAME,
         mcp_path="/mcp",
         get_auth_token=_current_auth_token,
+        get_debug_enabled=_current_debug_mcp_logging,
         instructions=MCP_INSTRUCTIONS,
     )
 
 
-def main() -> None:
+class _ReadySignalServer(uvicorn.Server):
+    def __init__(self, config: uvicorn.Config, *, ready_fd: int | None) -> None:
+        super().__init__(config)
+        self._ready_fd = ready_fd
+
+    def _emit_ready(self) -> None:
+        if self._ready_fd is None:
+            return
+        os.write(self._ready_fd, b"ready\n")
+        os.close(self._ready_fd)
+        self._ready_fd = None
+
+    def _close_ready_fd(self) -> None:
+        if self._ready_fd is None:
+            return
+        os.close(self._ready_fd)
+        self._ready_fd = None
+
+    async def startup(self, sockets=None) -> None:
+        await super().startup(sockets=sockets)
+        if not self.should_exit:
+            self._emit_ready()
+
+    async def serve(self, sockets=None) -> None:
+        try:
+            await super().serve(sockets=sockets)
+        finally:
+            self._close_ready_fd()
+
+
+def _consume_ready_fd() -> int | None:
+    raw_value = os.environ.pop("NOTION_LOCAL_OPS_READY_FD", "").strip()
+    if not raw_value:
+        return None
+    return int(raw_value)
+
+
+def build_uvicorn_server(*, fd: int | None = None, ready_fd: int | None = None) -> uvicorn.Server:
+    app = build_http_app()
+    config = uvicorn.Config(
+        app,
+        host=HOST,
+        port=PORT,
+        fd=fd,
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
+    )
+    return _ReadySignalServer(config, ready_fd=ready_fd)
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Run the notion-local-ops MCP server.")
+    parser.add_argument("--fd", type=int, default=None, help="Inherited listening socket fd.")
+    args = parser.parse_args(argv)
+
     ensure_runtime_directories()
     print(f"Starting {APP_NAME} on {HOST}:{PORT}")
     print(f"workspace_root={WORKSPACE_ROOT}")
     print(f"state_dir={STATE_DIR}")
     print("transport=streamable-http")
     print("mcp_path=/mcp")
-    app = build_http_app()
-    uvicorn.run(app, host=HOST, port=PORT)
+    print(f"debug_mcp_logging={DEBUG_MCP_LOGGING}")
+    print(f"graceful_shutdown_seconds={GRACEFUL_SHUTDOWN_SECONDS}")
+    server = build_uvicorn_server(fd=args.fd, ready_fd=_consume_ready_fd())
+    server.run()
 
 
 if __name__ == "__main__":

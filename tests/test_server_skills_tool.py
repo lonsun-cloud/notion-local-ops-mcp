@@ -48,3 +48,37 @@ def test_server_list_skills_tool_returns_structured_summary(tmp_path: Path) -> N
             ],
         }
     ]
+
+
+def test_server_list_skills_tool_forwards_new_filter_arguments(tmp_path: Path) -> None:
+    from notion_local_ops_mcp import server
+
+    captured: dict[str, object] = {}
+
+    def fake_list_skills_impl(**kwargs):
+        captured.update(kwargs)
+        return {"success": True, "skills": [], "scanned_roots": [], "filters": kwargs}
+
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    server.WORKSPACE_ROOT = workspace_root
+    server.list_skills_impl = fake_list_skills_impl
+
+    result = _call(
+        server.list_skills,
+        include_project=False,
+        include_global=True,
+        namespace="claude",
+        name_pattern="claude-*",
+        description_max_length=42,
+    )
+
+    assert result["success"] is True
+    assert captured == {
+        "workspace_root": workspace_root,
+        "include_project": False,
+        "include_global": True,
+        "namespace": "claude",
+        "name_pattern": "claude-*",
+        "description_max_length": 42,
+    }

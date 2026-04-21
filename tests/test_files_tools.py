@@ -146,6 +146,25 @@ def test_read_file_reports_line_unit_and_language(tmp_path: Path) -> None:
     assert result["language"] in {"python", "x-python"}
 
 
+def test_read_file_can_include_line_numbers(tmp_path: Path) -> None:
+    target = tmp_path / "app.py"
+    target.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+
+    result = read_file(
+        target,
+        offset=2,
+        limit=2,
+        max_lines=50,
+        max_bytes=4096,
+        include_line_numbers=True,
+    )
+
+    assert result["success"] is True
+    assert result["content"] == "2: beta\n3: gamma"
+    assert result["start_line"] == 2
+    assert result["end_line"] == 3
+
+
 def test_write_file_creates_parent_directories(tmp_path: Path) -> None:
     target = tmp_path / "deep" / "file.txt"
 

@@ -1,7 +1,15 @@
 from __future__ import annotations
 
 import re
+from fnmatch import fnmatch
 from pathlib import Path
+
+from .files import (
+    DEFAULT_EXCLUDE_DIR_NAMES,
+    _find_git_root,
+    _git_tracked_allowed_paths,
+    _iter_filtered,
+)
 
 
 def _error(code: str, message: str, **extra: object) -> dict[str, object]:
@@ -16,13 +24,20 @@ def _error(code: str, message: str, **extra: object) -> dict[str, object]:
     return payload
 
 
-def _validate_directory(path: Path) -> dict[str, object] | None:
+def _validate_existing_path(path: Path) -> dict[str, object] | None:
     if not path.exists():
         return _error(
             "path_not_found",
             f"Path not found: {path}",
             resolved_path=str(path),
         )
+    return None
+
+
+def _validate_directory(path: Path) -> dict[str, object] | None:
+    validation_error = _validate_existing_path(path)
+    if validation_error:
+        return validation_error
     if not path.is_dir():
         return _error(
             "not_a_directory",
@@ -43,9 +58,95 @@ def _paginate(items: list[object], *, offset: int, limit: int) -> tuple[list[obj
     return selected, truncated, next_offset
 
 
-def _iter_matching_files(base_path: Path, glob_pattern: str | None) -> list[Path]:
-    matcher = glob_pattern or "*"
-    return [path for path in sorted(base_path.rglob(matcher), key=lambda item: str(item)) if path.is_file()]
+def _resolve_allowed_paths(base_path: Path, *, respect_gitignore: bool) -> tuple[set[Path] | None, bool]:
+    if not respect_gitignore:
+        return None, False
+
+    repo_root = _find_git_root(base_path)
+    if repo_root is None:
+        return None, False
+
+    allowed = _git_tracked_allowed_paths(repo_root)
+    return allowed, allowed is not None
+
+
+def _matches_exclude_patterns(
+    path: Path,
+    *,
+    base_path: Path,
+    exclude_patterns: tuple[str, ...],
+) -> bool:
+    if not exclude_patterns:
+        return False
+    try:
+        relative = str(path.relative_to(base_path if base_path.is_dir() else base_path.parent))
+    except ValueError:
+        relative = path.name
+    return any(fnmatch(path.name, pattern) or fnmatch(relative, pattern) for pattern in exclude_patterns)
+
+
+def _glob_matches(path: Path, *, base_path: Path, pattern: str) -> bool:
+    try:
+        relative = str(path.relative_to(base_path if base_path.is_dir() else base_path.parent))
+    except ValueError:
+        relative = path.name
+    return fnmatch(relative, pattern) or fnmatch(path.name, pattern)
+
+
+def _iter_matching_entries(
+    base_path: Path,
+    *,
+    pattern: str,
+    include_hidden: bool,
+    respect_gitignore: bool,
+    exclude_patterns: tuple[str, ...],
+) -> tuple[list[Path], bool]:
+    allowed, gitignore_applied = _resolve_allowed_paths(
+        base_path,
+        respect_gitignore=respect_gitignore,
+    )
+
+    if base_path.is_file():
+        if not include_hidden and base_path.name.startswith("."):
+            return [], gitignore_applied
+        if _matches_exclude_patterns(base_path, base_path=base_path, exclude_patterns=exclude_patterns):
+            return [], gitignore_applied
+        if allowed is not None and base_path.resolve() not in allowed:
+            return [], gitignore_applied
+        return ([base_path] if _glob_matches(base_path, base_path=base_path, pattern=pattern) else []), gitignore_applied
+
+    entries = sorted(
+        _iter_filtered(
+            base_path,
+            recursive=True,
+            include_hidden=include_hidden,
+            exclude_dir_names=DEFAULT_EXCLUDE_DIR_NAMES,
+            exclude_patterns=exclude_patterns,
+            allowed=allowed,
+        ),
+        key=lambda item: str(item),
+    )
+    matches = [entry for entry in entries if _glob_matches(entry, base_path=base_path, pattern=pattern)]
+    return matches, gitignore_applied
+
+
+def _iter_matching_files(
+    base_path: Path,
+    *,
+    glob_pattern: str | None,
+    include_hidden: bool,
+    respect_gitignore: bool,
+    exclude_patterns: tuple[str, ...],
+) -> tuple[list[Path], bool]:
+    pattern = glob_pattern or "*"
+    entries, gitignore_applied = _iter_matching_entries(
+        base_path,
+        pattern=pattern,
+        include_hidden=include_hidden,
+        respect_gitignore=respect_gitignore,
+        exclude_patterns=exclude_patterns,
+    )
+    return [path for path in entries if path.is_file()], gitignore_applied
 
 
 def _read_text(path: Path) -> str | None:
@@ -64,19 +165,29 @@ def glob_files(
     pattern: str,
     limit: int,
     offset: int,
+    include_hidden: bool = False,
+    respect_gitignore: bool = True,
+    exclude_patterns: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, object]:
-    validation_error = _validate_directory(base_path)
+    validation_error = _validate_existing_path(base_path)
     if validation_error:
         return validation_error
 
-    matches = [
+    matches, gitignore_applied = _iter_matching_entries(
+        base_path,
+        pattern=pattern,
+        include_hidden=include_hidden,
+        respect_gitignore=respect_gitignore,
+        exclude_patterns=tuple(exclude_patterns or ()),
+    )
+    payload = [
         {
             "path": str(path),
             "is_dir": path.is_dir(),
         }
-        for path in sorted(base_path.rglob(pattern), key=lambda item: str(item))
+        for path in matches
     ]
-    selected, truncated, next_offset = _paginate(matches, offset=offset, limit=limit)
+    selected, truncated, next_offset = _paginate(payload, offset=offset, limit=limit)
     return {
         "success": True,
         "base_path": str(base_path),
@@ -84,6 +195,12 @@ def glob_files(
         "matches": selected,
         "truncated": truncated,
         "next_offset": next_offset,
+        "filters": {
+            "include_hidden": include_hidden,
+            "respect_gitignore": respect_gitignore,
+            "gitignore_applied": gitignore_applied,
+            "exclude_patterns": list(exclude_patterns or ()),
+        },
     }
 
 
@@ -99,8 +216,11 @@ def grep_files(
     head_limit: int,
     offset: int,
     multiline: bool = False,
+    include_hidden: bool = False,
+    respect_gitignore: bool = True,
+    exclude_patterns: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, object]:
-    validation_error = _validate_directory(base_path)
+    validation_error = _validate_existing_path(base_path)
     if validation_error:
         return validation_error
 
@@ -118,9 +238,18 @@ def grep_files(
     except re.error as exc:
         return _error("invalid_pattern", str(exc), pattern=pattern)
 
+    matches_exclude = tuple(exclude_patterns or ())
+    candidate_files, gitignore_applied = _iter_matching_files(
+        base_path,
+        glob_pattern=glob_pattern,
+        include_hidden=include_hidden,
+        respect_gitignore=respect_gitignore,
+        exclude_patterns=matches_exclude,
+    )
+
     if output_mode == "files_with_matches":
         files: list[str] = []
-        for path in _iter_matching_files(base_path, glob_pattern):
+        for path in candidate_files:
             content = _read_text(path)
             if content is None:
                 continue
@@ -135,11 +264,17 @@ def grep_files(
             "files": selected,
             "truncated": truncated,
             "next_offset": next_offset,
+            "filters": {
+                "include_hidden": include_hidden,
+                "respect_gitignore": respect_gitignore,
+                "gitignore_applied": gitignore_applied,
+                "exclude_patterns": list(matches_exclude),
+            },
         }
 
     if output_mode == "count":
         counts: list[dict[str, object]] = []
-        for path in _iter_matching_files(base_path, glob_pattern):
+        for path in candidate_files:
             content = _read_text(path)
             if content is None:
                 continue
@@ -155,10 +290,16 @@ def grep_files(
             "counts": selected,
             "truncated": truncated,
             "next_offset": next_offset,
+            "filters": {
+                "include_hidden": include_hidden,
+                "respect_gitignore": respect_gitignore,
+                "gitignore_applied": gitignore_applied,
+                "exclude_patterns": list(matches_exclude),
+            },
         }
 
     matches: list[dict[str, object]] = []
-    for path in _iter_matching_files(base_path, glob_pattern):
+    for path in candidate_files:
         content = _read_text(path)
         if content is None:
             continue
@@ -200,6 +341,12 @@ def grep_files(
         "matches": selected,
         "truncated": truncated,
         "next_offset": next_offset,
+        "filters": {
+            "include_hidden": include_hidden,
+            "respect_gitignore": respect_gitignore,
+            "gitignore_applied": gitignore_applied,
+            "exclude_patterns": list(matches_exclude),
+        },
     }
 
 
@@ -209,6 +356,9 @@ def search_files(
     query: str,
     glob_pattern: str | None,
     limit: int,
+    include_hidden: bool = False,
+    respect_gitignore: bool = True,
+    exclude_patterns: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, object]:
     result = grep_files(
         base_path,
@@ -221,6 +371,9 @@ def search_files(
         head_limit=limit,
         offset=0,
         multiline=False,
+        include_hidden=include_hidden,
+        respect_gitignore=respect_gitignore,
+        exclude_patterns=exclude_patterns,
     )
     if not result["success"]:
         return result
@@ -235,4 +388,5 @@ def search_files(
             for match in result["matches"]
         ],
         "truncated": result["truncated"],
+        "filters": result["filters"],
     }

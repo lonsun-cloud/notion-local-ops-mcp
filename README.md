@@ -36,34 +36,10 @@ Use this in your MCP Agent configuration inside Notion:
 - Auth type: `Bearer`
 - Token: `NOTION_LOCAL_OPS_AUTH_TOKEN`
 
-Both prompts below are for the **MCP Agent**. They are not for the Notion AI instruction page.
+Use the prompt below for the **MCP Agent**. It is not for the Notion AI instruction page.
 
 <details>
-<summary><strong>Short MCP Agent prompt</strong></summary>
-
-```text
-Act like a coding agent, not a Notion page editor.
-When the context contains repo paths, filenames, code extensions, README, AGENTS.md, CLAUDE.md, or .cursorrules, treat "document", "file", "notes", and "instructions" as local files unless the user explicitly says Notion page, wiki, or workspace page.
-For local file changes, do not use <edit_reference>. Use local file tools and, when useful, verify with git_diff, git_status, or tests.
-Use list_skills when the user asks about available skills or agent capabilities.
-Use direct tools first: server_info, set_default_cwd/get_default_cwd, search, read_text, write_file, apply_patch, git_status, git_diff, git_commit, git_log, git_show, git_blame, run_command.
-Use list_files only when directory structure itself matters, and paginate with limit/offset instead of assuming full output.
-Use search(mode='glob'|'regex'|'text') as the query tool for path discovery and content search.
-Use read_text(path=... or paths=[...]) as the reader with start_line/line_limit for line-based pagination.
-Use apply_patch for multi-change edits, same-file multi-location edits, file moves, deletes, or creates. Use dry_run=true, validate_only=true, or return_diff=true when you want validation or a preview before writing.
-Use write_file dry_run=true for a no-write preview when you need guard rails.
-Do not issue parallel writes to the same file.
-Use git_status, git_diff, git_commit, git_log, git_show, and git_blame for repository state and traceability instead of raw git shell commands when possible.
-Use run_command for quick shell work. For stream-like long jobs, prefer run_command_stream (or run_command with run_in_background=true) and follow with get_task/wait_task.
-Use purge_tasks periodically to clean old task logs (older_than_hours, dry_run=true first).
-Use delegate_task only when direct tools are insufficient for complex multi-file reasoning, long-running fallback execution, or repeated failed attempts with direct tools. When delegating non-trivial work, pass goal, acceptance_criteria, verification_commands, and commit_mode.
-After each logically meaningful change, create a small focused git commit so progress stays traceable. Keep unrelated changes out of the same commit.
-```
-
-</details>
-
-<details>
-<summary><strong>Full MCP Agent prompt</strong></summary>
+<summary><strong>Recommended MCP Agent prompt</strong></summary>
 
 ```text
 You are a pragmatic local operations agent connected to my computer through MCP.
@@ -93,16 +69,16 @@ Tool strategy:
 - server_info: call first when troubleshooting connection/runtime mismatches.
 - set_default_cwd / get_default_cwd: set once for repeated repo operations instead of passing cwd every time.
 - In coding tasks, search the local repo first. Do not default to searching the Notion workspace.
-- search: canonical query tool. mode='glob' for path discovery, mode='regex' for regex/code search, mode='text' for literal substring search.
-- list_files: inspect directory structure only when structure matters; paginate with limit and offset when needed.
-- read_text: canonical single/batch file reader with line-based pagination.
 - apply_patch: use this as the default edit tool for existing files, including small edits, multi-hunk edits, moves, deletes, or adds in one patch. Use dry_run=true, validate_only=true, or return_diff=true when you want validation or a preview before writing.
 - write_file: create new files or rewrite short files when that is simpler than patching; use dry_run=true for no-write preview.
-- git_status / git_diff / git_commit / git_log / git_show / git_blame: use these as the default repository workflow and traceability tools.
-- run_command: proactively use for non-destructive commands such as pwd, ls, rg, tests, builds, or smoke checks.
-- run_command_stream: start long-running shell jobs with immediate task_id return for polling progress.
-- delegate_task: use only for complex multi-file reasoning, long-running fallback execution, or repeated failed attempts with direct tools by local codex or claude-code. For non-trivial work, pass goal, acceptance_criteria, verification_commands, and commit_mode.
+- run_command_stream: start long-running shell jobs with immediate task_id return for polling progress. Prefer it for tests, installs, builds, compile steps, and other jobs that may take a while.
 - get_task / wait_task: check delegated task or background command status; prefer wait_task when blocking is useful.
+- run_command: proactively use for short non-destructive commands such as pwd, ls, rg, or small smoke checks.
+- search: canonical query tool. mode='glob' for path discovery, mode='regex' for regex/code search, mode='text' for literal substring search. Hidden entries and .gitignore'd paths are excluded by default; regex/text search can target a single file path directly.
+- list_files: inspect directory structure only when structure matters; paginate with limit and offset when needed.
+- read_text: canonical single/batch file reader with line-based pagination; set include_line_numbers=true when the result will be cited or reviewed line-by-line.
+- git_status / git_diff / git_commit / git_log / git_show / git_blame: use these as the default repository workflow and traceability tools only when the current cwd is actually inside a git repo.
+- delegate_task: use only for complex multi-file reasoning, long-running fallback execution, or repeated failed attempts with direct tools by local codex or claude-code. For non-trivial work, pass goal, acceptance_criteria, verification_commands, and commit_mode.
 - cancel_task: stop a delegated task if needed.
 - purge_tasks: garbage-collect stale task artifacts under STATE_DIR/tasks (dry_run first).
 
@@ -177,7 +153,8 @@ What you should expect:
 
 - the script creates or reuses `.venv`
 - the script installs missing Python dependencies automatically
-- the script starts the local MCP server on `http://127.0.0.1:8766/mcp`
+- the script starts the local MCP server on `http://127.0.0.1:8766/mcp` through a rolling-reload supervisor
+- the script prints a `./scripts/dev-tunnel.sh reload` command so you can restart the local server without dropping the tunnel
 - the script prefers `cloudflared.local.yml` for a named tunnel
 - otherwise it falls back to a `cloudflared` quick tunnel and prints a public HTTPS URL
 
@@ -211,6 +188,7 @@ NOTION_LOCAL_OPS_CODEX_COMMAND="codex"
 NOTION_LOCAL_OPS_CLAUDE_COMMAND="claude"
 NOTION_LOCAL_OPS_COMMAND_TIMEOUT="120"
 NOTION_LOCAL_OPS_DELEGATE_TIMEOUT="1800"
+NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS="30"
 ```
 
 ### Manual Start
@@ -239,7 +217,8 @@ What it does:
 - reuses or creates `.venv`
 - installs missing runtime dependencies
 - loads `.env` from the repo root if present
-- starts `notion-local-ops-mcp`
+- starts `notion-local-ops-mcp` behind a rolling-reload supervisor
+- keeps the public tunnel stable while `./scripts/dev-tunnel.sh reload` swaps in a fresh server process
 - prefers `cloudflared.local.yml` or `cloudflared.local.yaml` if present
 - otherwise opens a `cloudflared` quick tunnel to your local server
 
@@ -249,7 +228,18 @@ Notes:
 - `cloudflared.local.yml` is gitignored, so your local named tunnel config stays out of git
 - if `NOTION_LOCAL_OPS_WORKSPACE_ROOT` is unset, the script defaults it to the repo root
 - if `NOTION_LOCAL_OPS_AUTH_TOKEN` is unset, the script exits with an error instead of guessing
+- `./scripts/dev-tunnel.sh reload` sends `SIGHUP` to the supervisor and rolls the server process without dropping the public `/mcp` endpoint
 - for a fresh clone, you do not need to run `pip install` manually before using this script
+
+### Rolling Reload Without Dropping The Tunnel
+
+Once `./scripts/dev-tunnel.sh` is already running in one terminal or tmux pane, use this from another shell:
+
+```bash
+./scripts/dev-tunnel.sh reload
+```
+
+This keeps `cloudflared` attached to the same local port while the supervisor starts a fresh MCP server process, waits for readiness, and then drains the old one. It is the recommended way to pick up code changes without causing transient 502 responses to Notion.
 
 ### Expose With cloudflared
 
@@ -291,31 +281,50 @@ cloudflared tunnel --config ./cloudflared-example.yml run <your-tunnel-name>
 | `NOTION_LOCAL_OPS_CLAUDE_COMMAND` | no | `claude` |
 | `NOTION_LOCAL_OPS_COMMAND_TIMEOUT` | no | `120` |
 | `NOTION_LOCAL_OPS_DELEGATE_TIMEOUT` | no | `1800` |
+| `NOTION_LOCAL_OPS_DEBUG_MCP_LOGGING` | no | `0` |
+| `NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS` | no | `30` |
 
 ## MCP Tools
 
 - `list_files`: list files and directories with pagination; excludes hidden/junk dirs and respects `.gitignore` by default
 - `list_skills`: discover project and global skills with name and description summaries
-- `search`: canonical query tool that unifies glob path search, regex grep, and literal substring search
-- `read_text`: canonical single/batch reader with line-based pagination (`start_line`/`line_limit`) and `language` hint
+- `search`: canonical query tool that unifies glob path search, regex grep, and literal substring search; excludes hidden and `.gitignore`d paths by default and supports regex/text search against a single file path
+- `read_text`: canonical single/batch reader with line-based pagination (`start_line`/`line_limit`), optional `include_line_numbers`, and `language` hint
 - `write_file`: write full file content, supports `dry_run`
 - `apply_patch`: default edit tool for existing files; supports add/update/move/delete patches plus `dry_run`, `validate_only`, and optional diff output
 - `server_info`: inspect runtime config and the registered MCP tool list
 - `set_default_cwd`: set session default working directory for subsequent calls
 - `get_default_cwd`: inspect current session/effective working directory
-- `git_status`: structured repository status
+- `git_status`: structured repository status (use when cwd is inside a git repo)
 - `git_diff`: structured diff output grouped by file with per-file truncation
 - `git_commit`: stage selected paths or all changes and create a commit (`amend` / `allow_empty` / `author` / `sign_off` / `dry_run`)
 - `git_log`: recent commit history
 - `git_show`: inspect metadata and per-file diff for a commit/ref
 - `git_blame`: line-level blame metadata for a file/range
 - `run_command`: run local shell commands, optionally in background
-- `run_command_stream`: start a background shell job and poll output by task id
+- `run_command_stream`: start a background shell job and poll output by task id; this is the preferred route for long tests/builds/installs
 - `delegate_task`: send a task to local `codex` or `claude-code`, with optional `goal`, `acceptance_criteria`, `verification_commands`, and `commit_mode`
 - `get_task`: read task status and output tail
 - `wait_task`: block until a delegated or background shell task completes or times out
 - `cancel_task`: stop a delegated or background shell task
 - `purge_tasks`: clean old task artifacts from `STATE_DIR/tasks` with dry-run support
+
+## Debugging Notion / MCP handshake issues
+
+If a client appears connected but hangs during initialize, tools/list, or tool calls, enable verbose MCP request logging:
+
+```bash
+NOTION_LOCAL_OPS_DEBUG_MCP_LOGGING=1 ./scripts/dev-tunnel.sh
+```
+
+When enabled, the server log includes `MCP_DEBUG` lines with:
+
+- HTTP method and path
+- session id hint
+- JSON-RPC method
+- tool name for `tools/call`
+- truncated `arguments` summary for `tools/call`
+- response status and duration
 
 ## Verify
 
@@ -342,6 +351,7 @@ pytest -q tests/test_server_transport.py tests/test_concurrent_clients.py tests/
 - Check the auth type is `Bearer`
 - Check the token matches `NOTION_LOCAL_OPS_AUTH_TOKEN`
 - Check `cloudflared` is still running
+- If you are updating the server while users are connected, prefer `./scripts/dev-tunnel.sh reload` over killing and restarting the whole tunnel session
 
 ### MCP endpoint works locally but not over tunnel
 
@@ -352,6 +362,12 @@ pytest -q tests/test_server_transport.py tests/test_concurrent_clients.py tests/
 source .venv/bin/activate
 fastmcp list http://127.0.0.1:8766/mcp
 ```
+
+### Notion saw a temporary 502 while you were restarting
+
+- A Cloudflare 502 during restart usually means the origin was briefly unavailable, not that Cloudflare blocked the request
+- If this happened while you manually killed the tmux pane, switch to `./scripts/dev-tunnel.sh reload` so the supervisor overlaps the new server with the old one
+- Check the newest `notion-local-ops-mcp-server.*.log` file to confirm the replacement process reached readiness before the old one drained
 
 ### Logs show repeated 404s
 

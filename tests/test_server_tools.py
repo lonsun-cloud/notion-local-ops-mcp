@@ -136,6 +136,25 @@ def test_server_read_text_supports_single_and_batch_modes(tmp_path: Path) -> Non
     assert [item["content"] for item in batch["results"]] == ["alpha", "gamma"]
 
 
+def test_server_read_text_can_include_line_numbers(tmp_path: Path) -> None:
+    from notion_local_ops_mcp import server
+
+    first = tmp_path / "one.txt"
+    first.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+
+    single = _call(
+        server.read_text,
+        path=str(first),
+        start_line=2,
+        line_limit=2,
+        include_line_numbers=True,
+    )
+
+    assert single["success"] is True
+    assert single["mode"] == "single"
+    assert single["content"] == "2: beta\n3: gamma"
+
+
 def test_server_read_text_requires_exactly_one_path_argument(tmp_path: Path) -> None:
     from notion_local_ops_mcp import server
 
@@ -161,6 +180,26 @@ def test_server_search_validates_mode_and_required_fields(tmp_path: Path) -> Non
     assert missing_regex_pattern["error"]["code"] == "missing_pattern"
     assert missing_glob_pattern["success"] is False
     assert missing_glob_pattern["error"]["code"] == "missing_pattern"
+
+
+def test_server_search_supports_single_file_path_for_text_and_regex(tmp_path: Path) -> None:
+    from notion_local_ops_mcp import server
+
+    target = tmp_path / "one.py"
+    target.write_text("alpha\nTODO: fix me\n", encoding="utf-8")
+
+    text_result = _call(server.search, mode="text", path=str(target), query="TODO")
+    regex_result = _call(server.search, mode="regex", path=str(target), pattern=r"TODO:\s+\w+")
+
+    assert text_result["success"] is True
+    assert text_result["mode"] == "text"
+    assert len(text_result["matches"]) == 1
+    assert text_result["matches"][0]["path"] == str(target)
+
+    assert regex_result["success"] is True
+    assert regex_result["mode"] == "regex"
+    assert len(regex_result["matches"]) == 1
+    assert regex_result["matches"][0]["path"] == str(target)
 
 
 def test_server_delegate_task_accepts_structured_fields(tmp_path: Path) -> None:

@@ -22,6 +22,7 @@ dev = [
 
 [project.scripts]
 notion-local-ops-mcp = "notion_local_ops_mcp.server:main"
+notion-local-ops-supervisor = "notion_local_ops_mcp.supervisor:main"
 
 [tool.setuptools.package-dir]
 "" = "src"

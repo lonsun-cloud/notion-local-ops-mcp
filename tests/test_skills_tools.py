@@ -130,3 +130,53 @@ def test_list_skills_discovers_global_claude_root_without_hardcoded_username(tmp
         root["path"] == str(home_dir / ".claude" / "skills") and root["namespace"] == "claude"
         for root in result["scanned_roots"]
     )
+
+
+def test_list_skills_applies_filters_and_echoes_them(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    home_dir = tmp_path / "home"
+
+    _write_skill(
+        workspace_root / ".agents" / "skills",
+        "project-helper",
+        name="project-helper",
+        description="Project scoped helper",
+    )
+    _write_skill(
+        home_dir / ".claude" / "skills",
+        "claude-helper",
+        name="claude-helper",
+        description="Claude helper description that should be truncated",
+    )
+
+    result = list_skills(
+        workspace_root=workspace_root,
+        home_dir=home_dir,
+        namespace="claude",
+        name_pattern="claude-*",
+        description_max_length=20,
+    )
+
+    assert result["success"] is True
+    assert result["filters"] == {
+        "namespace": "claude",
+        "name_pattern": "claude-*",
+        "description_max_length": 20,
+        "include_project": True,
+        "include_global": True,
+    }
+    assert result["skills"] == [
+        {
+            "name": "claude-helper",
+            "description": "Claude helper descri…",
+            "preferred_path": str(home_dir / ".claude" / "skills" / "claude-helper" / "SKILL.md"),
+            "sources": [
+                {
+                    "scope": "global",
+                    "namespace": "claude",
+                    "path": str(home_dir / ".claude" / "skills" / "claude-helper" / "SKILL.md"),
+                }
+            ],
+        }
+    ]
+    assert all(root["namespace"] == "claude" for root in result["scanned_roots"])

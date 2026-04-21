@@ -198,6 +198,7 @@ def test_mcp_delegate_task_structured_output_end_to_end(tmp_path: Path, monkeypa
 def test_mcp_canonical_search_and_read_text_end_to_end(tmp_path: Path, monkeypatch) -> None:
     token = "secret-token"
     (tmp_path / "demo.py").write_text("alpha\nTODO item\n", encoding="utf-8")
+    (tmp_path / ".hidden.py").write_text("TODO hidden\n", encoding="utf-8")
 
     with _running_server(tmp_path, monkeypatch, auth_token=token) as url:
 
@@ -219,13 +220,28 @@ def test_mcp_canonical_search_and_read_text_end_to_end(tmp_path: Path, monkeypat
                         "path": "demo.py",
                         "start_line": 2,
                         "line_limit": 1,
+                        "include_line_numbers": True,
+                    },
+                )
+                single_file_search = await _call_tool(
+                    session,
+                    "search",
+                    {
+                        "mode": "text",
+                        "path": "demo.py",
+                        "query": "TODO",
                     },
                 )
                 assert found["success"] is True
                 assert found["mode"] == "glob"
                 assert any(item["path"].endswith("demo.py") for item in found["matches"])
+                assert all(not item["path"].endswith(".hidden.py") for item in found["matches"])
                 assert read["success"] is True
                 assert read["mode"] == "single"
-                assert read["content"] == "TODO item"
+                assert read["content"] == "2: TODO item"
+                assert single_file_search["success"] is True
+                assert single_file_search["mode"] == "text"
+                assert len(single_file_search["matches"]) == 1
+                assert single_file_search["matches"][0]["path"].endswith("demo.py")
 
         anyio.run(scenario)

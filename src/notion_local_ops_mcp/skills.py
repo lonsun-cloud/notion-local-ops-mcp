@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 from pathlib import Path
 
 
@@ -59,23 +60,28 @@ def list_skills(
     home_dir: Path | None = None,
     include_project: bool = True,
     include_global: bool = True,
+    namespace: str | None = None,
+    name_pattern: str | None = None,
+    description_max_length: int | None = None,
 ) -> dict[str, object]:
     resolved_workspace = workspace_root.expanduser().resolve()
     resolved_home = (home_dir or Path.home()).expanduser().resolve()
     scanned_roots: list[dict[str, object]] = []
     skills_by_name: dict[str, dict[str, object]] = {}
 
-    for scope, namespace, root in _iter_skill_roots(
+    for scope, ns, root in _iter_skill_roots(
         resolved_workspace,
         resolved_home,
         include_project=include_project,
         include_global=include_global,
     ):
+        if namespace is not None and ns != namespace:
+            continue
         exists = root.exists() and root.is_dir()
         scanned_roots.append(
             {
                 "scope": scope,
-                "namespace": namespace,
+                "namespace": ns,
                 "path": str(root),
                 "exists": exists,
             }
@@ -85,16 +91,26 @@ def list_skills(
 
         for skill_file in sorted(root.rglob("SKILL.md"), key=lambda item: str(item)):
             summary = _read_skill_summary(skill_file)
+            if name_pattern is not None and not fnmatch.fnmatchcase(
+                summary["name"], name_pattern
+            ):
+                continue
+            description = summary["description"]
+            if (
+                description_max_length is not None
+                and len(description) > description_max_length
+            ):
+                description = description[:description_max_length].rstrip() + "\u2026"
             source = {
                 "scope": scope,
-                "namespace": namespace,
+                "namespace": ns,
                 "path": str(skill_file),
             }
             existing = skills_by_name.get(summary["name"])
             if existing is None:
                 skills_by_name[summary["name"]] = {
                     "name": summary["name"],
-                    "description": summary["description"],
+                    "description": description,
                     "preferred_path": str(skill_file),
                     "sources": [source],
                 }
@@ -107,4 +123,11 @@ def list_skills(
         "workspace_root": str(resolved_workspace),
         "scanned_roots": scanned_roots,
         "skills": skills,
+        "filters": {
+            "namespace": namespace,
+            "name_pattern": name_pattern,
+            "description_max_length": description_max_length,
+            "include_project": include_project,
+            "include_global": include_global,
+        },
     }

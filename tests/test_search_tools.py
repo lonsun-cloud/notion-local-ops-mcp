@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 
 from notion_local_ops_mcp.search import glob_files, grep_files, search_files
@@ -12,6 +13,17 @@ def test_search_files_finds_text_matches(tmp_path: Path) -> None:
     assert result["success"] is True
     assert len(result["matches"]) == 1
     assert result["matches"][0]["path"].endswith("one.py")
+
+
+def test_search_files_supports_single_file_path(tmp_path: Path) -> None:
+    target = tmp_path / "one.py"
+    target.write_text("hello world\n", encoding="utf-8")
+
+    result = search_files(target, query="hello", glob_pattern=None, limit=20)
+
+    assert result["success"] is True
+    assert len(result["matches"]) == 1
+    assert result["matches"][0]["path"] == str(target)
 
 
 def test_glob_files_matches_nested_paths(tmp_path: Path) -> None:
@@ -85,3 +97,61 @@ def test_grep_files_count_mode_returns_per_file_counts(tmp_path: Path) -> None:
         {"path": str(tmp_path / "one.py"), "count": 2},
         {"path": str(tmp_path / "two.py"), "count": 1},
     ]
+
+
+def test_grep_files_supports_single_file_path(tmp_path: Path) -> None:
+    target = tmp_path / "one.py"
+    target.write_text("alpha\nTODO: fix me\n", encoding="utf-8")
+
+    result = grep_files(
+        target,
+        pattern=r"TODO:\s+\w+",
+        glob_pattern=None,
+        output_mode="content",
+        head_limit=20,
+        offset=0,
+    )
+
+    assert result["success"] is True
+    assert len(result["matches"]) == 1
+    assert result["matches"][0]["path"] == str(target)
+
+
+def test_search_defaults_hide_hidden_and_gitignored_paths(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "a@b.c"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=tmp_path, check=True)
+    (tmp_path / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+    (tmp_path / ".hidden.py").write_text("TODO hidden\n", encoding="utf-8")
+    (tmp_path / "ignored.txt").write_text("TODO ignored\n", encoding="utf-8")
+    (tmp_path / "visible.py").write_text("TODO visible\n", encoding="utf-8")
+
+    default = search_files(tmp_path, query="TODO", glob_pattern=None, limit=20)
+    assert default["success"] is True
+    assert [Path(match["path"]).name for match in default["matches"]] == ["visible.py"]
+
+    include_hidden = search_files(
+        tmp_path,
+        query="TODO",
+        glob_pattern=None,
+        limit=20,
+        include_hidden=True,
+    )
+    assert {Path(match["path"]).name for match in include_hidden["matches"]} == {
+        ".hidden.py",
+        "visible.py",
+    }
+
+    include_ignored = search_files(
+        tmp_path,
+        query="TODO",
+        glob_pattern=None,
+        limit=20,
+        respect_gitignore=False,
+        include_hidden=True,
+    )
+    assert {Path(match["path"]).name for match in include_ignored["matches"]} == {
+        ".hidden.py",
+        "ignored.txt",
+        "visible.py",
+    }

@@ -59,6 +59,17 @@ def _read_text(path: Path) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+def _render_lines(
+    lines: list[str],
+    *,
+    start_line: int,
+    include_line_numbers: bool,
+) -> str:
+    if not include_line_numbers:
+        return "\n".join(lines)
+    return "\n".join(f"{start_line + index}: {line}" for index, line in enumerate(lines))
+
+
 def _find_git_root(start: Path) -> Path | None:
     current = start if start.is_dir() else start.parent
     while True:
@@ -282,6 +293,7 @@ def read_file(
     limit: int | None,
     max_lines: int,
     max_bytes: int,
+    include_line_numbers: bool = False,
 ) -> dict[str, object]:
     if not path.exists():
         return _error("file_not_found", f"File not found: {path}", resolved_path=str(path))
@@ -297,7 +309,11 @@ def read_file(
     start = max(offset or 1, 1)
     line_limit = max(limit or max_lines, 1)
     selected = lines[start - 1 : start - 1 + line_limit]
-    content = "\n".join(selected)
+    content = _render_lines(
+        selected,
+        start_line=start,
+        include_line_numbers=include_line_numbers,
+    )
     truncated = start - 1 + line_limit < len(lines)
 
     encoded = content.encode("utf-8")
@@ -320,6 +336,7 @@ def read_file(
         "start_line": start,
         "end_line": end_line,
         "language": language,
+        "include_line_numbers": include_line_numbers,
     }
 
 
@@ -330,9 +347,17 @@ def read_files(
     limit: int | None,
     max_lines: int,
     max_bytes: int,
+    include_line_numbers: bool = False,
 ) -> dict[str, object]:
     results = [
-        read_file(path, offset=offset, limit=limit, max_lines=max_lines, max_bytes=max_bytes)
+        read_file(
+            path,
+            offset=offset,
+            limit=limit,
+            max_lines=max_lines,
+            max_bytes=max_bytes,
+            include_line_numbers=include_line_numbers,
+        )
         for path in paths
     ]
     return {
