@@ -11,6 +11,7 @@ from .http_compat import build_http_compat_app
 
 from .config import (
     APP_NAME,
+    AUTH_MODE,
     AUTH_TOKEN,
     CLAUDE_COMMAND,
     CODEX_COMMAND,
@@ -19,7 +20,11 @@ from .config import (
     DELEGATE_TIMEOUT,
     GRACEFUL_SHUTDOWN_SECONDS,
     HOST,
+    OAUTH_LOGIN_TOKEN,
+    OAUTH_SCOPES,
+    OAUTH_TOKEN_TTL_SECONDS,
     PORT,
+    PUBLIC_BASE_URL,
     STATE_DIR,
     WORKSPACE_ROOT,
     ensure_runtime_directories,
@@ -35,6 +40,7 @@ from .gitops import git_diff as git_diff_impl
 from .gitops import git_log as git_log_impl
 from .gitops import git_show as git_show_impl
 from .gitops import git_status as git_status_impl
+from .oauth import OAuthRuntimeConfig
 from .patching import apply_patch as apply_patch_impl
 from . import session
 from .pathing import resolve_cwd, resolve_path
@@ -76,12 +82,55 @@ def _current_auth_token() -> str:
     return globals().get("AUTH_TOKEN", "") or ""
 
 
+def _current_oauth_config() -> OAuthRuntimeConfig:
+    return OAuthRuntimeConfig(
+        auth_mode=globals().get("AUTH_MODE", "") or "",
+        auth_token=_current_auth_token(),
+        public_base_url=globals().get("PUBLIC_BASE_URL", "") or "",
+        state_dir=globals().get("STATE_DIR", STATE_DIR),
+        oauth_login_token=globals().get("OAUTH_LOGIN_TOKEN", "") or "",
+        oauth_scopes=tuple(globals().get("OAUTH_SCOPES", ("local-ops",)) or ("local-ops",)),
+        oauth_token_ttl_seconds=int(globals().get("OAUTH_TOKEN_TTL_SECONDS", 86400) or 86400),
+    )
+
+
 def _current_debug_mcp_logging() -> bool:
     return bool(globals().get("DEBUG_MCP_LOGGING", False))
 
 
+READ_ONLY_TOOL = {
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+}
+
+LOCAL_STATE_TOOL = {
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+}
+
+LOCAL_WRITE_TOOL = {
+    "readOnlyHint": False,
+    "destructiveHint": True,
+    "idempotentHint": False,
+    "openWorldHint": False,
+}
+
+OPEN_WORLD_WRITE_TOOL = {
+    "readOnlyHint": False,
+    "destructiveHint": True,
+    "idempotentHint": False,
+    "openWorldHint": True,
+}
+
+
 @mcp.tool(
     name="list_skills",
+    title="List Skills",
+    annotations=READ_ONLY_TOOL,
     description=(
         "List project and global agent skills as lightweight summaries. "
         "Returns skill name, description, preferred path, and source locations. "
@@ -109,6 +158,8 @@ def list_skills(
 
 @mcp.tool(
     name="list_files",
+    title="List Files",
+    annotations=READ_ONLY_TOOL,
     description=(
         "List files and directories. Hidden entries, common junk dirs "
         "(.git / .venv / node_modules / __pycache__ / ...) and .gitignore'd "
@@ -140,6 +191,8 @@ def list_files(
 
 @mcp.tool(
     name="search",
+    title="Search Workspace",
+    annotations=READ_ONLY_TOOL,
     description=(
         "Canonical search tool that unifies glob, regex grep, and plain-text search. "
         "Use mode='glob' for path discovery, mode='regex' for code/text regex, and "
@@ -235,6 +288,8 @@ def search(
 
 @mcp.tool(
     name="read_text",
+    title="Read Text",
+    annotations=READ_ONLY_TOOL,
     description=(
         "Canonical text-reader tool. Pass either `path` for single-file reads or "
         "`paths` for batch reads. Pagination is line-based via start_line/line_limit. "
@@ -291,6 +346,8 @@ def read_text(
 
 @mcp.tool(
     name="write_file",
+    title="Write File",
+    annotations=LOCAL_WRITE_TOOL,
     description="Write full content to a file (supports dry_run preview without touching disk).",
 )
 def write_file(path: str, content: str, dry_run: bool = False) -> dict[str, object]:
@@ -300,7 +357,13 @@ def write_file(path: str, content: str, dry_run: bool = False) -> dict[str, obje
 
 @mcp.tool(
     name="apply_patch",
-    description="Apply a codex-style patch with add, update, move, or delete operations.",
+    title="Apply Patch",
+    annotations=LOCAL_WRITE_TOOL,
+    description=(
+        "Apply a structured patch using *** Begin Patch / *** Update File blocks. "
+        "Each @@ hunk must contain at least one '+' or '-' line and must "
+        "match exactly one location in the target file; pure-context hunks are rejected."
+    ),
 )
 def apply_patch(
     patch: str,
@@ -319,6 +382,8 @@ def apply_patch(
 
 @mcp.tool(
     name="server_info",
+    title="Server Info",
+    annotations=READ_ONLY_TOOL,
     description=(
         "Return server metadata: app name, host/port, workspace root, state dir, "
         "timeouts, auth mode, and the list of registered tools. Useful as a first "
@@ -344,7 +409,7 @@ async def server_info() -> dict[str, object]:
         "state_dir": str(STATE_DIR),
         "command_timeout_seconds": COMMAND_TIMEOUT,
         "delegate_timeout_seconds": DELEGATE_TIMEOUT,
-        "auth": "bearer" if AUTH_TOKEN else "none",
+        "auth": _current_oauth_config().normalized_auth_mode,
         "debug_mcp_logging": bool(DEBUG_MCP_LOGGING),
         "codex_command": CODEX_COMMAND,
         "claude_command": CLAUDE_COMMAND,
@@ -355,6 +420,8 @@ async def server_info() -> dict[str, object]:
 
 @mcp.tool(
     name="set_default_cwd",
+    title="Set Default CWD",
+    annotations=LOCAL_STATE_TOOL,
     description=(
         "Set the session-wide default working directory used whenever a tool call "
         "omits `cwd`. Pass null (or omit path) to clear the override and fall back to "
@@ -401,6 +468,8 @@ def set_default_cwd(path: str | None = None) -> dict[str, object]:
 
 @mcp.tool(
     name="get_default_cwd",
+    title="Get Default CWD",
+    annotations=READ_ONLY_TOOL,
     description=(
         "Return the currently active default working directory and whether it comes "
         "from the session override (set_default_cwd) or from the server's workspace root."
@@ -420,6 +489,8 @@ def get_default_cwd() -> dict[str, object]:
 
 @mcp.tool(
     name="git_status",
+    title="Git Status",
+    annotations=READ_ONLY_TOOL,
     description="Return structured git status for the repository at cwd or the current workspace root.",
 )
 def git_status(cwd: str | None = None) -> dict[str, object]:
@@ -429,6 +500,8 @@ def git_status(cwd: str | None = None) -> dict[str, object]:
 
 @mcp.tool(
     name="git_diff",
+    title="Git Diff",
+    annotations=READ_ONLY_TOOL,
     description=(
         "Return git diff output plus per-file diffs with added/removed counts. "
         "Each file is truncated independently to per_file_max_bytes so a single huge "
@@ -454,6 +527,8 @@ def git_diff(
 
 @mcp.tool(
     name="git_commit",
+    title="Git Commit",
+    annotations=LOCAL_WRITE_TOOL,
     description=(
         "Create a git commit for staged changes, selected paths, or all current changes. "
         "Supports amend (rewrite HEAD), allow_empty (commit without changes), custom author, "
@@ -487,6 +562,8 @@ def git_commit(
 
 @mcp.tool(
     name="git_log",
+    title="Git Log",
+    annotations=READ_ONLY_TOOL,
     description="Return recent git commits for the repository at cwd.",
 )
 def git_log(cwd: str | None = None, limit: int = 10) -> dict[str, object]:
@@ -496,6 +573,8 @@ def git_log(cwd: str | None = None, limit: int = 10) -> dict[str, object]:
 
 @mcp.tool(
     name="git_show",
+    title="Git Show",
+    annotations=READ_ONLY_TOOL,
     description=(
         "Show metadata + per-file diff for a commit or any git ref (defaults to HEAD). "
         "Useful for inspecting a specific commit without shelling out."
@@ -518,6 +597,8 @@ def git_show(
 
 @mcp.tool(
     name="git_blame",
+    title="Git Blame",
+    annotations=READ_ONLY_TOOL,
     description=(
         "Return per-line blame info (commit, author, summary, content) for a file. "
         "Restrict to a line range via start_line / end_line."
@@ -542,6 +623,8 @@ def git_blame(
 
 @mcp.tool(
     name="run_command",
+    title="Run Command",
+    annotations=OPEN_WORLD_WRITE_TOOL,
     description="Run a local shell command now or queue it as a background task for wait_task/get_task polling.",
 )
 def run_command(
@@ -567,6 +650,8 @@ def run_command(
 
 @mcp.tool(
     name="run_command_stream",
+    title="Run Command Stream",
+    annotations=OPEN_WORLD_WRITE_TOOL,
     description=(
         "Start a shell command in background and return task_id immediately for "
         "stream-like polling via get_task/wait_task."
@@ -591,6 +676,8 @@ def run_command_stream(
 
 @mcp.tool(
     name="delegate_task",
+    title="Delegate Task",
+    annotations=OPEN_WORLD_WRITE_TOOL,
     description=(
         "Fallback only. Use this when direct tools are insufficient for a complex, long-running, or "
         "multi-file task. Supported executors: auto, codex, claude-code. "
@@ -629,6 +716,8 @@ def delegate_task(
 
 @mcp.tool(
     name="get_task",
+    title="Get Task",
+    annotations=READ_ONLY_TOOL,
     description="Get the current status and output tail for a delegated or background shell task.",
 )
 def get_task(task_id: str) -> dict[str, object]:
@@ -637,6 +726,8 @@ def get_task(task_id: str) -> dict[str, object]:
 
 @mcp.tool(
     name="wait_task",
+    title="Wait Task",
+    annotations=READ_ONLY_TOOL,
     description="Wait for a delegated or background shell task to finish or until timeout, then return its latest status and output tail.",
 )
 def wait_task(task_id: str, timeout: float = 30, poll_interval: float = 0.5) -> dict[str, object]:
@@ -645,6 +736,8 @@ def wait_task(task_id: str, timeout: float = 30, poll_interval: float = 0.5) -> 
 
 @mcp.tool(
     name="cancel_task",
+    title="Cancel Task",
+    annotations=LOCAL_WRITE_TOOL,
     description="Cancel a delegated or background shell task if it is still running.",
 )
 def cancel_task(task_id: str) -> dict[str, object]:
@@ -653,6 +746,8 @@ def cancel_task(task_id: str) -> dict[str, object]:
 
 @mcp.tool(
     name="purge_tasks",
+    title="Purge Tasks",
+    annotations=LOCAL_WRITE_TOOL,
     description=(
         "Delete old task metadata/log directories under STATE_DIR/tasks. "
         "Defaults to 7 days; supports dry_run preview."
@@ -680,6 +775,7 @@ def build_http_app():
         app_name=APP_NAME,
         mcp_path="/mcp",
         get_auth_token=_current_auth_token,
+        get_oauth_config=_current_oauth_config,
         get_debug_enabled=_current_debug_mcp_logging,
         instructions=MCP_INSTRUCTIONS,
     )
@@ -747,6 +843,25 @@ def main(argv: list[str] | None = None) -> None:
     print("mcp_path=/mcp")
     print(f"debug_mcp_logging={DEBUG_MCP_LOGGING}")
     print(f"graceful_shutdown_seconds={GRACEFUL_SHUTDOWN_SECONDS}")
+
+    oauth_config = _current_oauth_config()
+    if oauth_config.normalized_auth_mode == "oauth":
+        if not oauth_config.public_base_url:
+            print(
+                "WARNING: NOTION_LOCAL_OPS_PUBLIC_BASE_URL is not set; OAuth "
+                "metadata will fall back to the request Host header. Set it to "
+                "your public tunnel URL (e.g. https://mcp.example.com) so issuer "
+                "URLs cannot be spoofed."
+            )
+        if not oauth_config.oauth_login_token and oauth_config.auth_token:
+            print(
+                "WARNING: NOTION_LOCAL_OPS_OAUTH_LOGIN_TOKEN is not set; "
+                "AUTH_TOKEN is being reused as the OAuth login token. Anyone "
+                "with AUTH_TOKEN can mint long-TTL OAuth access tokens. After "
+                "rotating AUTH_TOKEN, also clear oauth.json[\"tokens\"] under "
+                f"{STATE_DIR}/oauth.json."
+            )
+
     server = build_uvicorn_server(fd=args.fd, ready_fd=_consume_ready_fd())
     server.run()
 

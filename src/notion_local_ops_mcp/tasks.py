@@ -16,6 +16,10 @@ class TaskStore:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
+        try:
+            self.root.chmod(0o700)
+        except OSError:
+            pass
         self._lock = threading.RLock()
 
     def _task_dir(self, task_id: str) -> Path:
@@ -36,6 +40,10 @@ class TaskStore:
     def _write_text(self, path: Path, content: str) -> None:
         temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         temp_path.write_text(content, encoding="utf-8")
+        try:
+            temp_path.chmod(0o600)
+        except OSError:
+            pass
         temp_path.replace(path)
 
     def create(
@@ -52,6 +60,11 @@ class TaskStore:
             task_id = uuid.uuid4().hex[:12]
             task_dir = self._task_dir(task_id)
             task_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                task_dir.parent.chmod(0o700)
+                task_dir.chmod(0o700)
+            except OSError:
+                pass
             payload = {
                 "task_id": task_id,
                 "task": task,

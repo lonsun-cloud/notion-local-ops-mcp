@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import contextlib
+import base64
+import hashlib
 import logging
+import secrets
 import socket
+import stat
 import threading
 import time
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import anyio
 import httpx
@@ -212,6 +217,203 @@ def test_http_app_does_not_require_auth_for_oauth_discovery_probe(monkeypatch) -
         response = client.get("/.well-known/oauth-authorization-server")
 
     assert response.status_code == 404
+
+
+def test_shared_token_mode_rejects_when_auth_token_is_empty(monkeypatch) -> None:
+    # Guard against an empty/misconfigured AUTH_TOKEN silently allowing requests
+    # that omit the Authorization header (both sides would compare equal as "").
+    monkeypatch.setattr(server, "AUTH_MODE", "shared_token")
+    monkeypatch.setattr(server, "AUTH_TOKEN", "")
+    app = build_http_app()
+
+    with TestClient(app) as client:
+        response = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
+
+    assert response.status_code == 401
+
+
+def test_oauth_metadata_does_not_trust_x_forwarded_host(monkeypatch, tmp_path) -> None:
+    # Without PUBLIC_BASE_URL the issuer URL falls back to the request's Host
+    # header, but X-Forwarded-Host must NOT be honored: a tunnel attacker could
+    # otherwise redirect the OAuth metadata to a phishing host.
+    monkeypatch.setattr(server, "AUTH_MODE", "oauth")
+    monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    monkeypatch.setattr(server, "PUBLIC_BASE_URL", "")
+    monkeypatch.setattr(server, "STATE_DIR", tmp_path)
+    app = build_http_app()
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/.well-known/oauth-authorization-server",
+            headers={"X-Forwarded-Host": "attacker.example", "X-Forwarded-Proto": "https"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "attacker.example" not in body["issuer"]
+    assert "attacker.example" not in body["authorization_endpoint"]
+
+
+def test_oauth_register_enforces_client_limit(monkeypatch, tmp_path) -> None:
+    from notion_local_ops_mcp.oauth import MAX_REGISTERED_CLIENTS
+
+    monkeypatch.setattr(server, "AUTH_MODE", "oauth")
+    monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://mcp.example.test")
+    monkeypatch.setattr(server, "STATE_DIR", tmp_path)
+    app = build_http_app()
+
+    payload = {
+        "client_name": "ChatGPT",
+        "redirect_uris": ["https://chat.openai.com/aip/callback"],
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    }
+
+    with TestClient(app) as client:
+        for _ in range(MAX_REGISTERED_CLIENTS):
+            ok = client.post("/oauth/register", json=payload)
+            assert ok.status_code == 201
+        rejected = client.post("/oauth/register", json=payload)
+
+    assert rejected.status_code == 400
+    assert rejected.json()["error"] == "invalid_client_metadata"
+
+
+def test_oauth_store_file_permissions_are_locked_down(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(server, "AUTH_MODE", "oauth")
+    monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://mcp.example.test")
+    monkeypatch.setattr(server, "STATE_DIR", tmp_path)
+    app = build_http_app()
+
+    with TestClient(app) as client:
+        registration = client.post(
+            "/oauth/register",
+            json={
+                "client_name": "ChatGPT",
+                "redirect_uris": ["https://chat.openai.com/aip/callback"],
+            },
+        )
+
+    assert registration.status_code == 201
+    oauth_path = tmp_path / "oauth.json"
+    assert oauth_path.exists()
+    file_mode = stat.S_IMODE(oauth_path.stat().st_mode)
+    assert file_mode == 0o600, f"oauth.json mode={oct(file_mode)} (expected 0o600)"
+
+
+def test_http_app_exposes_minimal_oauth_metadata(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(server, "AUTH_MODE", "oauth")
+    monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://mcp.example.test")
+    monkeypatch.setattr(server, "STATE_DIR", tmp_path)
+    app = build_http_app()
+
+    with TestClient(app) as client:
+        resource = client.get("/.well-known/oauth-protected-resource/mcp")
+        issuer = client.get("/.well-known/oauth-authorization-server")
+
+    assert resource.status_code == 200
+    assert resource.json()["resource"] == "https://mcp.example.test/mcp"
+    assert resource.json()["authorization_servers"] == ["https://mcp.example.test"]
+    assert resource.json()["scopes_supported"] == ["local-ops"]
+    assert resource.json()["bearer_methods_supported"] == ["header"]
+
+    assert issuer.status_code == 200
+    issuer_body = issuer.json()
+    assert issuer_body["issuer"] == "https://mcp.example.test"
+    assert issuer_body["authorization_endpoint"] == "https://mcp.example.test/oauth/authorize"
+    assert issuer_body["token_endpoint"] == "https://mcp.example.test/oauth/token"
+    assert issuer_body["registration_endpoint"] == "https://mcp.example.test/oauth/register"
+    assert issuer_body["code_challenge_methods_supported"] == ["S256"]
+
+
+def test_http_app_oauth_challenge_advertises_resource_metadata(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(server, "AUTH_MODE", "oauth")
+    monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://mcp.example.test")
+    monkeypatch.setattr(server, "STATE_DIR", tmp_path)
+    app = build_http_app()
+
+    with TestClient(app) as client:
+        response = client.get("/mcp", headers={"Accept": "text/event-stream"})
+
+    assert response.status_code == 401
+    challenge = response.headers["www-authenticate"]
+    expected_metadata = 'resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp"'
+    assert expected_metadata in challenge
+    assert 'scope="local-ops"' in challenge
+
+
+def test_http_app_oauth_dcr_pkce_flow_allows_mcp_access(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(server, "AUTH_MODE", "oauth")
+    monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://mcp.example.test")
+    monkeypatch.setattr(server, "STATE_DIR", tmp_path)
+    app = build_http_app()
+
+    verifier = secrets.token_urlsafe(32)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    redirect_uri = "https://chat.openai.com/aip/callback"
+
+    with TestClient(app, follow_redirects=False) as client:
+        registration = client.post(
+            "/oauth/register",
+            json={
+                "client_name": "ChatGPT",
+                "redirect_uris": [redirect_uri],
+                "grant_types": ["authorization_code"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none",
+            },
+        )
+        assert registration.status_code == 201
+        client_id = registration.json()["client_id"]
+
+        authorize = client.post(
+            "/oauth/authorize",
+            data={
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "response_type": "code",
+                "state": "state-123",
+                "scope": "local-ops",
+                "resource": "https://mcp.example.test/mcp",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "login_token": "secret-token",
+            },
+        )
+        assert authorize.status_code == 303
+        parsed_redirect = urlparse(authorize.headers["location"])
+        params = parse_qs(parsed_redirect.query)
+        assert parsed_redirect.geturl().startswith(redirect_uri)
+        assert params["state"] == ["state-123"]
+        code = params["code"][0]
+
+        token = client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "client_id": client_id,
+                "code_verifier": verifier,
+                "resource": "https://mcp.example.test/mcp",
+            },
+        )
+        assert token.status_code == 200
+        access_token = token.json()["access_token"]
+        assert token.json()["token_type"] == "Bearer"
+
+        response = client.get(
+            "/mcp",
+            headers={"Accept": "*/*", "Authorization": f"Bearer {access_token}"},
+        )
+        assert response.status_code == 200
+        assert response.json()["transport"]["endpoint"] == "/mcp"
 
 
 def test_http_app_supports_legacy_sse_get_on_mcp(tmp_path, monkeypatch) -> None:

@@ -69,7 +69,7 @@ Tool strategy:
 - server_info: call first when troubleshooting connection/runtime mismatches.
 - set_default_cwd / get_default_cwd: set once for repeated repo operations instead of passing cwd every time.
 - In coding tasks, search the local repo first. Do not default to searching the Notion workspace.
-- apply_patch: use this as the default edit tool for existing files, including small edits, multi-hunk edits, moves, deletes, or adds in one patch. Use dry_run=true, validate_only=true, or return_diff=true when you want validation or a preview before writing.
+- apply_patch: 现有文件默认优先用它编辑，包括小改动、多 hunk 改动、移动、删除或一次 patch 里新增文件。每个 @@ hunk 都必须至少包含一行 '+' 或 '-'，并且必须在文件里唯一匹配。需要预检或预览时再用 dry_run=true / validate_only=true / return_diff=true。
 - write_file: create new files or rewrite short files when that is simpler than patching; use dry_run=true for no-write preview.
 - run_command_stream: start long-running shell jobs with immediate task_id return for polling progress. Prefer it for tests, installs, builds, compile steps, and other jobs that may take a while.
 - get_task / wait_task: check delegated task or background command status; prefer wait_task when blocking is useful.
@@ -189,6 +189,7 @@ NOTION_LOCAL_OPS_CLAUDE_COMMAND="claude"
 NOTION_LOCAL_OPS_COMMAND_TIMEOUT="120"
 NOTION_LOCAL_OPS_DELEGATE_TIMEOUT="1800"
 NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS="30"
+NOTION_LOCAL_OPS_LAUNCHD_LABEL_PREFIX="com.notion-local-ops"
 ```
 
 ### 手动启动
@@ -241,6 +242,36 @@ http://127.0.0.1:8766/mcp
 
 这个命令会保持 `cloudflared` 仍然连在同一个本地端口上，同时 supervisor 先拉起新的 MCP 服务、确认 ready，再让旧进程进入 drain。调试代码时，推荐优先用它而不是直接把整条 tunnel 会话杀掉。
 
+### macOS 持久化 launchd 安装
+
+如果你的目标是“关掉 shell / tmux 之后也要继续跑”，就安装 launchd 版本：
+
+```bash
+./scripts/install-launchd.sh
+```
+
+它会安装：
+
+- 一个本地 MCP supervisor 的 LaunchAgent
+- 一个 `cloudflared tunnel run` 的 LaunchAgent
+- 两者退出后由 `launchd KeepAlive` 自动拉起
+
+安装后常用命令：
+
+```bash
+./scripts/launchd-status.sh
+./scripts/launchd-reload.sh          # 代码更新后的平滑 reload
+./scripts/launchd-restart.sh mcp     # 依赖/环境变更后的 MCP 全量重启
+./scripts/launchd-restart.sh all     # MCP + cloudflared 一起重启
+./scripts/uninstall-launchd.sh
+```
+
+更新代码时的建议：
+
+- 仅 Python / 代码更新：`./scripts/launchd-reload.sh`
+- 依赖 / `.venv` / env 变更：`./scripts/launchd-restart.sh mcp`
+- tunnel 配置变更：`./scripts/launchd-restart.sh cloudflared`
+
 ### 用 cloudflared 暴露服务
 
 #### Quick tunnel
@@ -283,6 +314,7 @@ cloudflared tunnel --config ./cloudflared-example.yml run <your-tunnel-name>
 | `NOTION_LOCAL_OPS_DELEGATE_TIMEOUT` | 否 | `1800` |
 | `NOTION_LOCAL_OPS_DEBUG_MCP_LOGGING` | 否 | `0` |
 | `NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS` | 否 | `30` |
+| `NOTION_LOCAL_OPS_LAUNCHD_LABEL_PREFIX` | 否 | `com.notion-local-ops` |
 
 ## MCP 工具
 
@@ -291,7 +323,7 @@ cloudflared tunnel --config ./cloudflared-example.yml run <your-tunnel-name>
 - `search`：统一查询入口（glob 路径搜索 / regex 搜索 / literal 子串搜索）；默认排除隐藏项和 `.gitignore` 命中的路径，并支持对单文件直接做 regex/text 搜索
 - `read_text`：统一单文件/批量读取入口，支持按行分页（`start_line`/`line_limit`）、可选 `include_line_numbers` 和 `language` 提示
 - `write_file`：整文件写入，支持 `dry_run`
-- `apply_patch`：现有文件的默认编辑工具；支持 codex 风格 add / update / move / delete patch，以及 `dry_run`、`validate_only` 和可选 diff 输出
+- `apply_patch`：现有文件的默认编辑工具；使用 `*** Begin Patch` / `*** Update File` 文本语法，拒绝纯 context hunk，要求唯一 context 匹配，并返回每文件改动统计/警告
 - `server_info`：查看运行时配置与已注册工具清单
 - `set_default_cwd`：设置会话级默认工作目录
 - `get_default_cwd`：查看当前会话/生效工作目录
@@ -351,7 +383,8 @@ pytest -q tests/test_server_transport.py tests/test_concurrent_clients.py tests/
 - 确认鉴权类型是 `Bearer`
 - 确认 token 与 `NOTION_LOCAL_OPS_AUTH_TOKEN` 一致
 - 确认 `cloudflared` 仍在运行
-- 如果你在用户连接期间需要更新服务，优先使用 `./scripts/dev-tunnel.sh reload`，不要直接把整条 tunnel 会话杀掉
+- 如果你已经安装了 macOS LaunchAgent，先跑 `./scripts/launchd-status.sh`
+- 如果你在用户连接期间需要更新服务，优先使用 `./scripts/dev-tunnel.sh reload` 或 `./scripts/launchd-reload.sh`，不要直接把整条 tunnel 会话杀掉
 
 ### 本地 `/mcp` 正常，但通过 tunnel 不通
 

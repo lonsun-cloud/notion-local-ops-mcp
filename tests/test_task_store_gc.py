@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import stat
 from pathlib import Path
 
 from notion_local_ops_mcp.tasks import TaskStore
@@ -39,3 +40,18 @@ def test_purge_tasks_dry_run_keeps_files(tmp_path: Path) -> None:
     assert result["purged"] == 1
     assert task_id in result["task_ids"]
     assert (tmp_path / "state" / "tasks" / task_id).exists() is True
+
+
+def test_task_store_creates_state_with_owner_only_permissions(tmp_path: Path) -> None:
+    state_root = tmp_path / "state"
+    store = TaskStore(state_root)
+    created = store.create(task="t", executor="shell", cwd=str(tmp_path))
+    task_id = str(created["task_id"])
+    task_dir = state_root / "tasks" / task_id
+
+    assert stat.S_IMODE(state_root.stat().st_mode) == 0o700
+    assert stat.S_IMODE(task_dir.stat().st_mode) == 0o700
+    for name in ("meta.json", "stdout.log", "stderr.log", "summary.txt"):
+        path = task_dir / name
+        assert path.exists()
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600, f"{name} should be 0o600"

@@ -282,3 +282,52 @@ def test_server_purge_tasks_dry_run_reports_candidates(tmp_path: Path) -> None:
     finally:
         server.store = old_store
         server.registry = old_registry
+
+
+def test_server_apply_patch_tool_description_uses_generic_patch_language() -> None:
+    from notion_local_ops_mcp import server
+
+    async def scenario() -> str:
+        list_tools = getattr(server.mcp, "_list_tools")
+        try:
+            tools = await list_tools()
+        except TypeError:
+            tools = await list_tools(None)
+        apply_patch_tool = next(tool for tool in tools if tool.name == "apply_patch")
+        return apply_patch_tool.description
+
+    description = asyncio.run(scenario())
+
+    assert "codex-style" not in description
+    assert "*** Begin Patch" in description
+
+
+def test_server_tools_expose_chatgpt_compatible_annotations() -> None:
+    from notion_local_ops_mcp import server
+
+    async def scenario() -> dict[str, dict[str, object]]:
+        list_tools = getattr(server.mcp, "_list_tools")
+        try:
+            tools = await list_tools()
+        except TypeError:
+            tools = await list_tools(None)
+        return {
+            tool.name: {
+                "title": tool.title,
+                "annotations": tool.annotations.model_dump(exclude_none=True),
+            }
+            for tool in tools
+        }
+
+    descriptors = asyncio.run(scenario())
+    annotations = {name: value["annotations"] for name, value in descriptors.items()}
+
+    assert annotations
+    assert all(value["title"] for value in descriptors.values())
+    assert all(value for value in annotations.values())
+    assert annotations["server_info"]["readOnlyHint"] is True
+    assert annotations["search"]["readOnlyHint"] is True
+    assert annotations["write_file"]["readOnlyHint"] is False
+    assert annotations["write_file"]["destructiveHint"] is True
+    assert annotations["run_command"]["openWorldHint"] is True
+    assert annotations["delegate_task"]["openWorldHint"] is True
