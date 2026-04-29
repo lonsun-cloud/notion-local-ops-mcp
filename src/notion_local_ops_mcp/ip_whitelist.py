@@ -173,6 +173,20 @@ class IPWhitelistMiddleware:
 
         client_ip = _client_ip_from_scope(scope)
 
+        # Log real IP for every HTTP request.
+        headers = Headers(raw=scope.get("headers", []))
+        direct_ip = (scope.get("client") or ("", 0))[0]
+        cf_ip = headers.get("cf-connecting-ip", "").strip()
+        method = scope.get("method", "?")
+        path = scope.get("path", "?")
+        if cf_ip and cf_ip != direct_ip:
+            logger.info(
+                "%s %s  real_ip=%s  direct_ip=%s",
+                method, path, cf_ip, direct_ip,
+            )
+        else:
+            logger.info("%s %s  client_ip=%s", method, path, client_ip)
+
         # Check static list first (fast path).
         if client_ip and _ip_in_networks(client_ip, self._static):
             await self.app(scope, receive, send)
@@ -185,7 +199,7 @@ class IPWhitelistMiddleware:
                 await self.app(scope, receive, send)
                 return
 
-        logger.warning("Blocked request from IP %s (not in allowlist)", client_ip)
+        logger.warning("BLOCKED %s %s  client_ip=%s (not in allowlist)", method, path, client_ip)
         await send({
             "type": "http.response.start",
             "status": 403,
