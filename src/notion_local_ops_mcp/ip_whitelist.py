@@ -27,6 +27,13 @@ from urllib.error import URLError
 from starlette.datastructures import Headers
 
 logger = logging.getLogger("notion_local_ops_mcp.ip_whitelist")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("%(levelname)s:     %(name)s - %(message)s")
+    )
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
 
 Network = ipaddress.IPv4Network | ipaddress.IPv6Network
 Address = ipaddress.IPv4Address | ipaddress.IPv6Address
