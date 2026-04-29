@@ -18,6 +18,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import sys
 import threading
 import time
 from typing import Any
@@ -28,7 +29,7 @@ from starlette.datastructures import Headers
 
 logger = logging.getLogger("notion_local_ops_mcp.ip_whitelist")
 if not logger.handlers:
-    _handler = logging.StreamHandler()
+    _handler = logging.StreamHandler(sys.stdout)
     _handler.setFormatter(
         logging.Formatter("%(levelname)s:     %(name)s - %(message)s")
     )
