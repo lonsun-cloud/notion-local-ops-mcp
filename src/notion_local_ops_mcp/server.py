@@ -11,6 +11,9 @@ from .http_compat import build_http_compat_app
 
 from .config import (
     APP_NAME,
+    ALLOWED_IPS,
+    ALLOWED_IPS_REFRESH_SECONDS,
+    ALLOWED_IPS_URL,
     AUTH_MODE,
     AUTH_TOKEN,
     CLAUDE_COMMAND,
@@ -43,6 +46,7 @@ from .gitops import git_status as git_status_impl
 from .oauth import OAuthRuntimeConfig
 from .patching import apply_patch as apply_patch_impl
 from . import session
+from .ip_whitelist import build_ip_whitelist_middleware
 from .pathing import resolve_cwd, resolve_path
 from .search import glob_files as glob_files_impl
 from .search import grep_files as grep_files_impl
@@ -777,6 +781,11 @@ def build_http_app():
         get_auth_token=_current_auth_token,
         get_oauth_config=_current_oauth_config,
         get_debug_enabled=_current_debug_mcp_logging,
+        ip_whitelist_kwargs=build_ip_whitelist_middleware(
+            allowed_ips=ALLOWED_IPS,
+            allowed_ips_url=ALLOWED_IPS_URL,
+            refresh_seconds=ALLOWED_IPS_REFRESH_SECONDS,
+        ) or None,
         instructions=MCP_INSTRUCTIONS,
     )
 
@@ -843,6 +852,15 @@ def main(argv: list[str] | None = None) -> None:
     print("mcp_path=/mcp")
     print(f"debug_mcp_logging={DEBUG_MCP_LOGGING}")
     print(f"graceful_shutdown_seconds={GRACEFUL_SHUTDOWN_SECONDS}")
+
+    if ALLOWED_IPS or ALLOWED_IPS_URL:
+        print(f"ip_whitelist=enabled")
+        if ALLOWED_IPS:
+            print(f"  static_ips={ALLOWED_IPS}")
+        if ALLOWED_IPS_URL:
+            print(f"  remote_url={ALLOWED_IPS_URL} (refresh every {ALLOWED_IPS_REFRESH_SECONDS}s)")
+    else:
+        print("ip_whitelist=disabled (all IPs allowed)")
 
     oauth_config = _current_oauth_config()
     if oauth_config.normalized_auth_mode == "oauth":

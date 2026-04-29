@@ -18,6 +18,7 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 from starlette.routing import Mount, Route
 
 from .oauth import OAuthManager, OAuthRuntimeConfig
+from .ip_whitelist import IPWhitelistMiddleware
 
 SERVER_CARD_SCHEMA = "https://static.modelcontextprotocol.io/schemas/mcp-server-card/v1.json"
 PROTOCOL_VERSION = "2025-06-18"
@@ -524,6 +525,7 @@ def build_http_compat_app(
     get_auth_token: AuthTokenProvider,
     get_oauth_config: OAuthConfigProvider,
     get_debug_enabled: DebugEnabledProvider,
+    ip_whitelist_kwargs: dict[str, Any] | None = None,
     instructions: str,
 ) -> Starlette:
     app_version = _resolve_version(app_name)
@@ -635,6 +637,10 @@ def build_http_compat_app(
             Mount("/", app=dispatcher),
         ],
         middleware=[
+            StarletteMiddleware(
+                IPWhitelistMiddleware,
+                **(ip_whitelist_kwargs or {}),
+            ),
             StarletteMiddleware(
                 MCPDebugLoggingMiddleware,
                 get_debug_enabled=get_debug_enabled,

@@ -69,6 +69,15 @@ DEBUG_MCP_LOGGING = _env_flag("NOTION_LOCAL_OPS_DEBUG_MCP_LOGGING", default=Fals
 GRACEFUL_SHUTDOWN_SECONDS = int(
     os.environ.get("NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS", "30")
 )
+# IP whitelist: comma-separated CIDRs/IPs. Empty = disabled (all traffic allowed).
+ALLOWED_IPS = os.environ.get("NOTION_LOCAL_OPS_ALLOWED_IPS", "").strip()
+# URL to fetch dynamic IP list (e.g. https://openai.com/chatgpt-connectors.json).
+# Empty = disabled.
+ALLOWED_IPS_URL = os.environ.get("NOTION_LOCAL_OPS_ALLOWED_IPS_URL", "").strip()
+# How often (seconds) to refresh the remote IP list. Default: 4 hours.
+ALLOWED_IPS_REFRESH_SECONDS = int(
+    os.environ.get("NOTION_LOCAL_OPS_ALLOWED_IPS_REFRESH_SECONDS", "14400")
+)
 
 
 def ensure_runtime_directories() -> None:
