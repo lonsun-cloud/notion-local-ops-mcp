@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -70,8 +72,22 @@ def _error(code: str, message: str, **extra: object) -> dict[str, object]:
     return payload
 
 
+_LINE_SPLIT_RE = re.compile(r"\r\n|\n")
+
+
 def _split_lines(text: str) -> list[str]:
-    return text.splitlines()
+    """Split ``text`` into lines using only ``\\n`` / ``\\r\\n`` separators.
+
+    Unlike :py:meth:`str.splitlines`, this ignores ``\\v``, ``\\f``, bare
+    ``\\r``, ``U+0085``, ``U+2028`` and ``U+2029`` so that source files
+    containing those bytes are not silently fragmented across lines.
+    """
+    if not text:
+        return []
+    parts = _LINE_SPLIT_RE.split(text)
+    if parts and parts[-1] == "":
+        parts.pop()
+    return parts
 
 
 def _join_lines(lines: list[str], *, trailing_newline: bool) -> str:
@@ -178,7 +194,7 @@ def _parse_update_file(lines: list[str], start: int) -> tuple[UpdateFilePatch, i
 
 
 def parse_patch(patch: str) -> list[PatchOperation]:
-    lines = patch.splitlines()
+    lines = _split_lines(patch)
     if not lines or lines[0] != "*** Begin Patch":
         raise PatchError("invalid_patch", "Patch must start with '*** Begin Patch'.")
 
@@ -203,16 +219,6 @@ def parse_patch(patch: str) -> list[PatchOperation]:
         raise PatchError("invalid_patch", f"Unexpected patch header: {line}")
 
     raise PatchError("invalid_patch", "Patch must end with '*** End Patch'.")
-
-
-def _find_sequence(lines: list[str], needle: list[str], start: int) -> int:
-    if not needle:
-        return -1
-    max_start = len(lines) - len(needle) + 1
-    for index in range(max(start, 0), max_start + 1):
-        if lines[index : index + len(needle)] == needle:
-            return index
-    return -1
 
 
 def _find_sequence_matches(lines: list[str], needle: list[str]) -> list[int]:
@@ -272,6 +278,60 @@ def _exact_hunk_candidates(
     return suggestions
 
 
+def _char_repr(ch: str) -> str:
+    if not ch:
+        return "''"
+    return f"{ch!r} (U+{ord(ch):04X})"
+
+
+def _repr_lines(lines: list[str]) -> list[str]:
+    """Return each line escaped via ``unicode_escape`` so non-printable or
+    confusable characters (full-width punctuation, NBSP, zero-width joiners,
+    etc.) are visible in JSON error payloads instead of rendering as the
+    look-alike glyph the caller already failed to match against.
+    """
+    return [line.encode("unicode_escape").decode("ascii") for line in lines]
+
+
+def _confusable_diff(
+    needle: list[str], haystack: list[str]
+) -> list[dict[str, object]]:
+    """If the expected context fails an exact match but matches under NFKC
+    normalisation, return per-character differences so callers can see when a
+    full-width or look-alike character has crept into the patch.
+    """
+    if not needle or not haystack:
+        return []
+    nfkc_needle = [unicodedata.normalize("NFKC", line) for line in needle]
+    nfkc_haystack = [unicodedata.normalize("NFKC", line) for line in haystack]
+    max_start = len(nfkc_haystack) - len(nfkc_needle)
+    findings: list[dict[str, object]] = []
+    for i in range(0, max_start + 1):
+        if nfkc_haystack[i : i + len(nfkc_needle)] != nfkc_needle:
+            continue
+        mismatches: list[dict[str, object]] = []
+        for j, (expected_line, actual_line) in enumerate(
+            zip(needle, haystack[i : i + len(nfkc_needle)])
+        ):
+            if expected_line == actual_line:
+                continue
+            for col in range(max(len(expected_line), len(actual_line))):
+                ec = expected_line[col] if col < len(expected_line) else ""
+                ac = actual_line[col] if col < len(actual_line) else ""
+                if ec != ac:
+                    mismatches.append(
+                        {
+                            "expected_line_index": j,
+                            "file_line": i + j + 1,
+                            "column": col + 1,
+                            "expected": _char_repr(ec),
+                            "actual": _char_repr(ac),
+                        }
+                    )
+        findings.append({"file_line": i + 1, "mismatches": mismatches})
+    return findings
+
+
 def _apply_hunk(
     lines: list[str],
     hunk: UpdateHunk,
@@ -285,20 +345,29 @@ def _apply_hunk(
     search_start = max(cursor - len(old_lines), 0)
     matches = _find_sequence_matches(lines, old_lines)
     if not matches:
-        raise PatchError(
-            "patch_context_not_found",
-            (
-                f"Could not match update hunk #{hunk_index + 1} in {path}. "
-                "See `candidates` for the closest line windows; the hunk's expected "
-                "context is in `expected`."
-            ),
-            path=str(path),
-            hunk_index=hunk_index,
-            patch_line=hunk.patch_line,
-            expected=old_lines,
-            search_started_at_line=search_start + 1,
-            candidates=_fuzzy_hunk_candidates(lines, old_lines, k=3),
+        confusables = _confusable_diff(old_lines, lines)
+        extra: dict[str, object] = {
+            "path": str(path),
+            "hunk_index": hunk_index,
+            "patch_line": hunk.patch_line,
+            "expected": old_lines,
+            "expected_repr": _repr_lines(old_lines),
+            "search_started_at_line": search_start + 1,
+            "candidates": _fuzzy_hunk_candidates(lines, old_lines, k=3),
+        }
+        if confusables:
+            extra["confusables"] = confusables
+        message = (
+            f"Could not match update hunk #{hunk_index + 1} in {path}. "
+            "See `candidates` for the closest line windows; the hunk's expected "
+            "context is in `expected` (escaped form in `expected_repr`)."
         )
+        if confusables:
+            message += (
+                " The file matches under NFKC normalisation \u2014 see "
+                "`confusables` for the offending character(s) (look-alike vs ASCII)."
+            )
+        raise PatchError("patch_context_not_found", message, **extra)
     if len(matches) != 1:
         raise PatchError(
             "ambiguous_context_match",
@@ -310,6 +379,7 @@ def _apply_hunk(
             hunk_index=hunk_index,
             patch_line=hunk.patch_line,
             expected=old_lines,
+            expected_repr=_repr_lines(old_lines),
             match_count=len(matches),
             expected_match_count=1,
             matching_lines=[match + 1 for match in matches],
