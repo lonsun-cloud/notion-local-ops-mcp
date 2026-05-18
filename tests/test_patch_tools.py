@@ -264,3 +264,62 @@ def test_apply_patch_returns_change_stats_and_warnings(tmp_path: Path) -> None:
     ]
     assert result["warnings"] == file_summary["warnings"]
     assert target.read_text(encoding="utf-8") == "alpha\nbeta\nomega\n"
+
+
+def test_apply_patch_reports_confusable_full_width_hash(tmp_path: Path) -> None:
+    target = tmp_path / "script.sh"
+    target.write_text("\u0023 heading\necho ok\n", encoding="utf-8")
+
+    result = apply_patch(
+        patch="\n".join(
+            [
+                "*** Begin Patch",
+                "*** Update File: script.sh",
+                "@@",
+                "-\uff03 heading",
+                "+\u0023 NEW heading",
+                " echo ok",
+                "*** End Patch",
+            ]
+        ),
+        workspace_root=tmp_path,
+    )
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "patch_context_not_found"
+    assert result["expected_repr"] == ["\\uff03 heading", "echo ok"]
+    confusables = result["confusables"]
+    assert isinstance(confusables, list) and confusables
+    first = confusables[0]
+    assert first["file_line"] == 1
+    mismatches = first["mismatches"]
+    assert mismatches and "U+FF03" in mismatches[0]["expected"]
+    assert "U+0023" in mismatches[0]["actual"]
+    assert mismatches[0]["column"] == 1
+    assert target.read_text(encoding="utf-8") == "\u0023 heading\necho ok\n"
+
+
+def test_apply_patch_splits_only_on_lf_or_crlf(tmp_path: Path) -> None:
+    # File contains a vertical tab (U+000B) which str.splitlines() would treat
+    # as a separator. With the new \n / \r\n only splitter the line remains
+    # intact, so the patch context matches exactly.
+    target = tmp_path / "weird.txt"
+    target.write_text("alpha\u000Bbeta\nend\n", encoding="utf-8")
+
+    result = apply_patch(
+        patch="\n".join(
+            [
+                "*** Begin Patch",
+                "*** Update File: weird.txt",
+                "@@",
+                " alpha\u000Bbeta",
+                "-end",
+                "+END",
+                "*** End Patch",
+            ]
+        ),
+        workspace_root=tmp_path,
+    )
+
+    assert result["success"] is True
+    assert target.read_text(encoding="utf-8") == "alpha\u000Bbeta\nEND\n"
