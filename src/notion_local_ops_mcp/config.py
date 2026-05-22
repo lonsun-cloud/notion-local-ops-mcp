@@ -78,6 +78,8 @@ ALLOWED_IPS_URL = os.environ.get("NOTION_LOCAL_OPS_ALLOWED_IPS_URL", "").strip()
 ALLOWED_IPS_REFRESH_SECONDS = int(
     os.environ.get("NOTION_LOCAL_OPS_ALLOWED_IPS_REFRESH_SECONDS", "14400")
 )
+TOOL_PROFILE = os.environ.get("NOTION_LOCAL_OPS_TOOL_PROFILE", "full").strip().lower() or "full"
+COMMAND_GUARD = os.environ.get("NOTION_LOCAL_OPS_COMMAND_GUARD", "off").strip().lower() or "off"
 
 
 def ensure_runtime_directories() -> None:
