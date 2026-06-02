@@ -253,8 +253,6 @@ NOTION_LOCAL_OPS_COMMAND_TIMEOUT="120"
 NOTION_LOCAL_OPS_DELEGATE_TIMEOUT="1800"
 NOTION_LOCAL_OPS_TOOL_PROFILE="full"
 NOTION_LOCAL_OPS_COMMAND_GUARD="off"
-NOTION_LOCAL_OPS_AUTO_PURGE_INTERVAL_SECONDS="3600"
-NOTION_LOCAL_OPS_AUTO_PURGE_OLDER_HOURS="168"
 NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS="30"
 NOTION_LOCAL_OPS_LAUNCHD_LABEL_PREFIX="com.notion-local-ops"
 ```
@@ -388,8 +386,6 @@ cloudflared tunnel --config ./cloudflared-example.yml run <your-tunnel-name>
 | `NOTION_LOCAL_OPS_DELEGATE_TIMEOUT` | no | `1800` |
 | `NOTION_LOCAL_OPS_TOOL_PROFILE` | no | `full` (`read-only` hides and blocks write/shell/delegate tools) |
 | `NOTION_LOCAL_OPS_COMMAND_GUARD` | no | `off` (`warn` annotates risky shell commands, `block` rejects them) |
-| `NOTION_LOCAL_OPS_AUTO_PURGE_INTERVAL_SECONDS` | no | `3600` (`<=0` disables the background auto-purge loop) |
-| `NOTION_LOCAL_OPS_AUTO_PURGE_OLDER_HOURS` | no | `168` (age in hours of task artifacts eligible for auto-purge) |
 | `NOTION_LOCAL_OPS_DEBUG_MCP_LOGGING` | no | `0` |
 | `NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS` | no | `30` |
 | `NOTION_LOCAL_OPS_LAUNCHD_LABEL_PREFIX` | no | `com.notion-local-ops` |
@@ -402,12 +398,6 @@ should inspect files/git/task output but not edit files, run shell commands,
 commit, delegate, cancel, or purge. Set `NOTION_LOCAL_OPS_COMMAND_GUARD=warn`
 or `block` to opt into simple shell risk checks for network-looking and
 destructive commands; `off` is the default.
-
-On startup the server reaps leftover `queued`/`running` tasks (marking them
-`abandoned`) and starts a background auto-purge loop that periodically deletes
-old task artifacts under `STATE_DIR/tasks`. Tune it with
-`NOTION_LOCAL_OPS_AUTO_PURGE_INTERVAL_SECONDS` (set `<=0` to disable) and
-`NOTION_LOCAL_OPS_AUTO_PURGE_OLDER_HOURS`.
 
 - `list_files`: list files and directories with pagination; excludes hidden/junk dirs and respects `.gitignore` by default
 - `list_skills`: discover project and global skills with name and description summaries
@@ -430,8 +420,7 @@ old task artifacts under `STATE_DIR/tasks`. Tune it with
 - `get_task`: read task status and output tail
 - `wait_task`: block until a delegated or background shell task completes or times out
 - `cancel_task`: stop a delegated or background shell task
-- `purge_tasks`: clean old task artifacts from `STATE_DIR/tasks` with dry-run support; supports an optional `statuses` filter (e.g. only `cancelled`/`failed`/`abandoned`)
-- `reap_stale_tasks`: mark leftover `queued`/`running` tasks from a previous process as `abandoned`; also runs automatically on every startup
+- `purge_tasks`: clean old task artifacts from `STATE_DIR/tasks` with dry-run support
 
 ## Debugging Notion / MCP handshake issues
 
