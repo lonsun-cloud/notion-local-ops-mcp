@@ -191,6 +191,8 @@ NOTION_LOCAL_OPS_COMMAND_TIMEOUT="120"
 NOTION_LOCAL_OPS_DELEGATE_TIMEOUT="1800"
 NOTION_LOCAL_OPS_TOOL_PROFILE="full"
 NOTION_LOCAL_OPS_COMMAND_GUARD="off"
+NOTION_LOCAL_OPS_AUTO_PURGE_INTERVAL_SECONDS="3600"
+NOTION_LOCAL_OPS_AUTO_PURGE_OLDER_HOURS="168"
 NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS="30"
 NOTION_LOCAL_OPS_LAUNCHD_LABEL_PREFIX="com.notion-local-ops"
 ```
@@ -318,6 +320,8 @@ cloudflared tunnel --config ./cloudflared-example.yml run <your-tunnel-name>
 | `NOTION_LOCAL_OPS_DELEGATE_TIMEOUT` | 否 | `1800` |
 | `NOTION_LOCAL_OPS_TOOL_PROFILE` | 否 | `full`（`read-only` 会隐藏并拦截写入 / shell / delegate 工具） |
 | `NOTION_LOCAL_OPS_COMMAND_GUARD` | 否 | `off`（`warn` 标注风险 shell 命令，`block` 拒绝执行） |
+| `NOTION_LOCAL_OPS_AUTO_PURGE_INTERVAL_SECONDS` | 否 | `3600`（`<=0` 关闭后台自动清理循环） |
+| `NOTION_LOCAL_OPS_AUTO_PURGE_OLDER_HOURS` | 否 | `168`（自动清理任务产物的时间阈值，单位小时） |
 | `NOTION_LOCAL_OPS_DEBUG_MCP_LOGGING` | 否 | `0` |
 | `NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS` | 否 | `30` |
 | `NOTION_LOCAL_OPS_LAUNCHD_LABEL_PREFIX` | 否 | `com.notion-local-ops` |
@@ -328,6 +332,11 @@ cloudflared tunnel --config ./cloudflared-example.yml run <your-tunnel-name>
 `NOTION_LOCAL_OPS_TOOL_PROFILE=read-only`，只允许查看文件、搜索、git 只读信息和
 task 输出，不允许写文件、跑 shell、commit、delegate、cancel 或 purge。若想打开简单
 shell 风险检查，可设置 `NOTION_LOCAL_OPS_COMMAND_GUARD=warn` 或 `block`；默认 `off` 不拦截。
+
+服务启动时会回收上一个进程残留的 `queued`/`running` 任务（标记为 `abandoned`），
+并启动后台自动清理循环，定期删除 `STATE_DIR/tasks` 下的旧任务产物。可通过
+`NOTION_LOCAL_OPS_AUTO_PURGE_INTERVAL_SECONDS`（设为 `<=0` 关闭）和
+`NOTION_LOCAL_OPS_AUTO_PURGE_OLDER_HOURS` 调整。
 
 - `list_files`：列出文件和目录并支持分页；默认排除隐藏/噪声目录并尊重 `.gitignore`
 - `list_skills`：发现项目级和全局 skills，并返回名称与简介
@@ -350,7 +359,8 @@ shell 风险检查，可设置 `NOTION_LOCAL_OPS_COMMAND_GUARD=warn` 或 `block`
 - `get_task`：读取后台任务状态和输出尾部
 - `wait_task`：阻塞等待后台 shell 任务或委托任务完成或超时
 - `cancel_task`：停止后台 shell 任务或委托任务
-- `purge_tasks`：清理 `STATE_DIR/tasks` 下的旧任务产物（支持 `dry_run`）
+- `purge_tasks`：清理 `STATE_DIR/tasks` 下的旧任务产物（支持 `dry_run`）；支持可选的 `statuses` 过滤（如只清理 `cancelled`/`failed`/`abandoned`）
+- `reap_stale_tasks`：把上一个进程残留的 `queued`/`running` 任务标记为 `abandoned`；每次启动时也会自动执行
 
 ## 调试 Notion / MCP 握手卡住
 
