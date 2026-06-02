@@ -6,7 +6,7 @@
 如果你只想看最短路径：**第 1 → 6 步** 就能跑通 Quick Tunnel，把本地 MCP 服务暴露成一个临时公网 URL，并接到 Notion。
 需要稳定域名请继续看 **第 7 步 · Named Tunnel**。
 
-> 项目总览与可选进阶用法见根目录 [`README.zh-CN.md`](./README.zh-CN.md)。
+> 项目总览与可选进阶用法见根目录 [`README.md`](./README.md)。
 
 ---
 
@@ -75,7 +75,7 @@ NOTION_LOCAL_OPS_AUTH_TOKEN=<随机令牌>
 
 把输出复制进 `.env`。
 
-其他字段（端口、codex/claude CLI 等）全部可选，默认值见 `.env.example` 与 `README.zh-CN.md` 的环境变量表。
+其他字段（端口、codex/claude CLI 等）全部可选，默认值见 `.env.example` 与 `README.md` 的环境变量表。
 
 ---
 
@@ -132,7 +132,7 @@ https://<随机字符串>.trycloudflare.com
 - **Auth type**：`Bearer`
 - **Token**：粘贴 `.env` 里 `NOTION_LOCAL_OPS_AUTH_TOKEN` 的值（逐字节一致，不要多空格）
 
-MCP Agent 的 prompt 模板（短版 / 完整版）直接去 [`README.zh-CN.md`](./README.zh-CN.md) 的两个 `<details>` 折叠块复制即可，本文不再重复。
+MCP Agent 的 prompt 模板（短版 / 完整版）直接去 [`README.md`](./README.md) 的两个 `<details>` 折叠块复制即可，本文不再重复。
 
 配置完成后，在 Notion 跟 MCP Agent 对话 "列出当前工作目录下的文件" 能返回结果就算通了。
 
@@ -265,5 +265,5 @@ Invoke-WebRequest http://127.0.0.1:8766/mcp `
 
 ## 下一步
 
-- 可选：把 `codex` / `claude` CLI 装上，`delegate_task` 就能把长任务丢到本地 agent 去跑（参考 [`README.zh-CN.md`](./README.zh-CN.md) 的"环境变量"表里 `NOTION_LOCAL_OPS_CODEX_COMMAND` / `NOTION_LOCAL_OPS_CLAUDE_COMMAND`）
+- 可选：把 `codex` / `claude` CLI 装上，`delegate_task` 就能把长任务丢到本地 agent 去跑（参考 [`README.md`](./README.md) 的"环境变量"表里 `NOTION_LOCAL_OPS_CODEX_COMMAND` / `NOTION_LOCAL_OPS_CLAUDE_COMMAND`）
 - 进阶用例：[`docs\notion-use-case.zh-CN.md`](./docs/notion-use-case.zh-CN.md) 介绍 Notion AI 指令页与项目管理结合玩法

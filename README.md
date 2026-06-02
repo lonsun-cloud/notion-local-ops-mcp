@@ -1,7 +1,5 @@
 # notion-local-ops-mcp
 
-[English](./README.md)
-
 把 Notion 里的 **MCP Agent** 变成一个可操作本地文件、shell、git 和委托任务的 coding agent。
 
 ![在本地仓库中工作的 MCP Agent](./assets/notion/notion-handoff-chat.png)
